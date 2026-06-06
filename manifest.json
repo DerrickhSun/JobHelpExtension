@@ -7,7 +7,8 @@
         "256": "icons/border-256.png"
     },
     "permissions": [
-        "activeTab"
+        "activeTab",
+        "storage"
     ],
     "host_permissions": [
         "https://*/*"
@@ -19,7 +20,7 @@
     "content_scripts": [
         {
             "matches": ["https://*/*"],
-            "js": ["content.js"],
+            "js": ["content_scripts/content.js"],
             "run_at": "document_idle"
         }
     ],
@@ -32,6 +33,21 @@
         }
     },
     "action": {
-        "default_popup": "popup.html"
-    }
+        "default_title": "Taskbar",
+        "default_icon": "icons/beasts-32.png",
+        "theme_icons": [
+        {
+            "light": "icons/beasts-32-light.png",
+            "dark": "icons/beasts-32.png",
+            "size": 32
+        }
+        ],
+        "default_popup": "popup/choose_beast.html"
+    },
+    "web_accessible_resources": [
+        {
+            "resources": ["icons/beasts-32.png", "icons/beasts-32-light.png"],
+            "matches": ["<all_urls>"]
+        }
+    ]
 }
