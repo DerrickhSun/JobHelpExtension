@@ -8,7 +8,8 @@
     },
     "permissions": [
         "activeTab",
-        "storage"
+        "storage",
+        "downloads"
     ],
     "host_permissions": [
         "https://*/*"
@@ -20,7 +21,8 @@
     "content_scripts": [
         {
             "matches": ["https://*/*"],
-            "js": ["content_scripts/content.js"],
+            "js": ["content_scripts/shift.js", "content_scripts/content.js"],
+            "css": ["content_scripts/content.css"],
             "run_at": "document_idle"
         }
     ],
@@ -41,8 +43,7 @@
             "dark": "icons/beasts-32.png",
             "size": 32
         }
-        ],
-        "default_popup": "popup/choose_beast.html"
+        ]
     },
     "web_accessible_resources": [
         {
