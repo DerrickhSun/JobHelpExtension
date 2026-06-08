@@ -98,8 +98,8 @@ function sharedEnsureTaskbar() {
         ":host{display:block;width:100%;height:100%;}" +
         ".bar{display:flex;align-items:center;gap:8px;height:100%;padding:0 12px;" +
         "box-sizing:border-box;font-family:system-ui,sans-serif;}" +
-        "." + SHARED_TASKBAR.SLOTS_CLASS + "{display:flex;align-items:center;gap:8px;}" +
-        "." + SHARED_TASKBAR.SLOT_CLASS + "{display:flex;align-items:center;gap:6px;}" +
+        "." + SHARED_TASKBAR.SLOTS_CLASS + "{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;}" +
+        "." + SHARED_TASKBAR.SLOT_CLASS + "{display:flex;align-items:center;gap:6px;flex:0 0 auto;}" +
         "button{padding:6px 12px;font-size:13px;cursor:pointer;}" +
         "</style>" +
         '<div class="bar"><div class="' + SHARED_TASKBAR.SLOTS_CLASS + '"></div></div>';

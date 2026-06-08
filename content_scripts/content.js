@@ -36,15 +36,35 @@ function buildButtons(slot) {
 }
 
 const browser = globalThis.browser ?? globalThis.chrome;
+
+// Persist our own active flag so the taskbar survives navigation/reload. This
+// is per-extension storage; the other sharing extension persists its slot
+// independently and the shared module re-merges them (in `order`) on each page.
+const ACTIVE_KEY = "taskbarActive";
+
+function showTaskbar() {
+  registerTaskbar(EXT_KEY, buildButtons, TASKBAR_ORDER);
+}
+
+function hideTaskbar() {
+  unregisterTaskbar(EXT_KEY);
+}
+
 browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'TOGGLE_TASKBAR') {
     const registered = isTaskbarRegistered(EXT_KEY);
     if (registered) {
-      unregisterTaskbar(EXT_KEY);
+      hideTaskbar();
     } else {
-      registerTaskbar(EXT_KEY, buildButtons, TASKBAR_ORDER);
+      showTaskbar();
     }
+    browser.storage.local.set({ [ACTIVE_KEY]: !registered });
     sendResponse({ visible: !registered });
   }
   return true; // keep channel open for async sendResponse
+});
+
+// On every page load, restore our slot if it was active when we last toggled.
+browser.storage.local.get(ACTIVE_KEY).then((stored) => {
+  if (stored[ACTIVE_KEY]) showTaskbar();
 });
