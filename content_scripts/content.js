@@ -10,7 +10,7 @@ const EXT_KEY = "jobhelp";
 // appear SECOND, so this must be greater than the other extension's order.
 const TASKBAR_ORDER = 20;
 
-// Uses the downloads API so repeated exports overwrite the same filename.
+// Uses the downloads API; prior extension exports are removed before each save.
 function saveTextFile(text, filename) {
     return browser.runtime.sendMessage({
         type: "DOWNLOAD_TEXT_FILE",
@@ -635,7 +635,6 @@ const SAVED_MENU_HOVER_CLOSE_MS = 350;
 const SAVED_MENU_VIEWPORT_MARGIN = 8;
 const SAVED_QUESTION_PREVIEW_LENGTH = 30;
 const SAVE_BUTTON_REFRESH_MS = 1000;
-let savedMenuCloseHandler = null;
 let savedMenuHoverCloseTimer = null;
 let questionsMenuHoverCloseTimer = null;
 let saveButtonRefreshTimer = null;
@@ -664,9 +663,10 @@ function startSaveButtonRefresh(saveBtn) {
     saveButtonRefreshTimer = setInterval(() => updateSaveButtonState(saveBtn), SAVE_BUTTON_REFRESH_MS);
 }
 
-function isInsideSavedMenu(target, menuRoot) {
+function isInsideSavedMenu(target, menuRoot, menu) {
     if (!target) return false;
-    return target === menuRoot || menuRoot.contains(target);
+    return target === menuRoot || menuRoot.contains(target) ||
+        target === menu || menu.contains(target);
 }
 
 function isInsideQuestionsMenu(target, menuRoot, menu) {
@@ -831,6 +831,37 @@ async function removeSavedJob(job) {
     await browser.storage.local.set({ [SAVED_JOBS_KEY]: filtered });
 }
 
+async function clearSavedJobs() {
+    await browser.storage.local.set({ [SAVED_JOBS_KEY]: [] });
+}
+
+function formatSavedJobsCountLabel(count) {
+    if (!count) return "No jobs saved";
+    if (count === 1) return "1 job saved";
+    return count + " jobs saved";
+}
+
+function updateSavedJobsCountBtn(btn, menuRoot) {
+    getSavedJobs().then((jobs) => {
+        btn.textContent = formatSavedJobsCountLabel(jobs.length);
+        btn.title = jobs.length
+            ? "Hover to preview saved jobs; click to clear"
+            : "Save a job to add it here";
+
+        if (!menuRoot) return;
+
+        const menu = menuRoot.querySelector(".jobhelp-saved-menu");
+        if (!jobs.length) {
+            closeSavedJobsMenu(menuRoot);
+            return;
+        }
+        if (menu && !menu.hidden) {
+            renderSavedJobsMenu(menu, jobs, menuRoot);
+            positionSavedJobsMenu(menuRoot, menu);
+        }
+    });
+}
+
 async function getSavedApplicationQuestions() {
     const stored = await browser.storage.local.get(SAVED_APPLICATION_QUESTIONS_KEY);
     return stored[SAVED_APPLICATION_QUESTIONS_KEY] || [];
@@ -942,7 +973,7 @@ async function downloadAllSavedJobs() {
     if (questions.length) {
         await saveTextFile(
             formatApplicationQuestionsDownloadText(questions),
-            "job_application_questions.txt"
+            "saved_job_application_questions.txt"
         );
     }
 }
@@ -969,7 +1000,7 @@ function injectSlotStyles(slot) {
         ".jobhelp-saved-remove:hover{color:#b00020;background:#fde8e8;}" +
         ".jobhelp-saved-menu li.jobhelp-saved-empty,.jobhelp-questions-menu li.jobhelp-questions-empty{" +
         "padding:8px 12px;color:#666;font-style:italic;}" +
-        ".jobhelp-questions-count{cursor:pointer;}" +
+        ".jobhelp-questions-count,.jobhelp-saved-count{cursor:pointer;}" +
         "button:disabled{opacity:0.55;cursor:not-allowed;}";
     slot.prepend(style);
 }
@@ -1004,8 +1035,14 @@ function renderSavedJobsMenu(menu, jobs, menuRoot) {
             event.stopPropagation();
             removeSavedJob(job).then(() => {
                 getSavedJobs().then((updated) => {
-                    renderSavedJobsMenu(menu, updated, menuRoot);
-                    if (!menu.hidden && menuRoot) {
+                    const btn = menuRoot?.querySelector(".jobhelp-saved-count");
+                    if (!updated.length) {
+                        closeSavedJobsMenu(menuRoot);
+                    }
+                    if (btn) {
+                        updateSavedJobsCountBtn(btn, menuRoot);
+                    } else if (updated.length && !menu.hidden && menuRoot) {
+                        renderSavedJobsMenu(menu, updated, menuRoot);
                         positionSavedJobsMenu(menuRoot, menu);
                     }
                 });
@@ -1077,11 +1114,6 @@ function closeSavedJobsMenu(menuRoot) {
         menu.hidden = true;
         resetSavedJobsMenuPosition(menu);
     }
-
-    if (savedMenuCloseHandler) {
-        document.removeEventListener("mousedown", savedMenuCloseHandler, true);
-        savedMenuCloseHandler = null;
-    }
 }
 
 function openSavedJobsMenu(menuRoot) {
@@ -1091,19 +1123,10 @@ function openSavedJobsMenu(menuRoot) {
     clearSavedMenuHoverCloseTimer();
 
     getSavedJobs().then((jobs) => {
+        if (!jobs.length) return;
+
         renderSavedJobsMenu(menu, jobs, menuRoot);
         positionSavedJobsMenu(menuRoot, menu);
-
-        if (savedMenuCloseHandler) {
-            document.removeEventListener("mousedown", savedMenuCloseHandler, true);
-        }
-
-        savedMenuCloseHandler = (event) => {
-            const path = event.composedPath();
-            if (path.includes(menuRoot)) return;
-            closeSavedJobsMenu(menuRoot);
-        };
-        document.addEventListener("mousedown", savedMenuCloseHandler, true);
     });
 }
 
@@ -1123,6 +1146,7 @@ function buildButtons(slot) {
         if (!job) return;
 
         await addSavedJob(job);
+        updateSavedJobsCountBtn(savedJobsBtn, menuWrap);
 
         const applicationRoot = getLinkedInApplicationRoot();
         if (applicationRoot || findLinkedInEasyApplyMarker()) {
@@ -1192,47 +1216,55 @@ function buildButtons(slot) {
     const menuWrap = document.createElement("div");
     menuWrap.className = "jobhelp-saved-wrap";
 
-    const listBtn = document.createElement("button");
-    listBtn.type = "button";
-    listBtn.textContent = "Saved jobs";
-    listBtn.addEventListener("click", (event) => {
-        event.stopPropagation();
-        const menu = menuWrap.querySelector(".jobhelp-saved-menu");
-        if (menu && !menu.hidden) {
-            closeSavedJobsMenu(menuWrap);
-        } else {
-            openSavedJobsMenu(menuWrap);
-        }
+    const savedJobsBtn = document.createElement("button");
+    savedJobsBtn.type = "button";
+    savedJobsBtn.className = "jobhelp-saved-count";
+    savedJobsBtn.addEventListener("click", async () => {
+        const jobs = await getSavedJobs();
+        if (!jobs.length) return;
+
+        const confirmed = window.confirm(
+            "Clear all " + jobs.length + " saved job" +
+            (jobs.length === 1 ? "" : "s") + "?"
+        );
+        if (!confirmed) return;
+
+        await clearSavedJobs();
+        updateSavedJobsCountBtn(savedJobsBtn, menuWrap);
+        closeSavedJobsMenu(menuWrap);
     });
+    updateSavedJobsCountBtn(savedJobsBtn, menuWrap);
 
     const menu = document.createElement("ul");
     menu.className = "jobhelp-saved-menu";
     menu.hidden = true;
 
-    const cancelHoverClose = () => clearSavedMenuHoverCloseTimer();
+    const cancelSavedHoverClose = () => clearSavedMenuHoverCloseTimer();
 
-    menuWrap.addEventListener("mouseenter", cancelHoverClose);
-    menu.addEventListener("mouseenter", cancelHoverClose);
+    menuWrap.addEventListener("mouseenter", () => {
+        cancelSavedHoverClose();
+        openSavedJobsMenu(menuWrap);
+    });
 
     menuWrap.addEventListener("mouseleave", (event) => {
-        if (!isInsideSavedMenu(event.relatedTarget, menuWrap) &&
-            !isInsideSavedMenu(event.relatedTarget, menu)) {
-            scheduleSavedMenuHoverClose(menuWrap);
-        }
-    });
-    menu.addEventListener("mouseleave", (event) => {
-        if (!isInsideSavedMenu(event.relatedTarget, menuWrap) &&
-            !isInsideSavedMenu(event.relatedTarget, menu)) {
+        if (!isInsideSavedMenu(event.relatedTarget, menuWrap, menu)) {
             scheduleSavedMenuHoverClose(menuWrap);
         }
     });
 
-    menuWrap.appendChild(listBtn);
+    menu.addEventListener("mouseenter", cancelSavedHoverClose);
+    menu.addEventListener("mouseleave", (event) => {
+        if (!isInsideSavedMenu(event.relatedTarget, menuWrap, menu)) {
+            scheduleSavedMenuHoverClose(menuWrap);
+        }
+    });
+
+    menuWrap.appendChild(savedJobsBtn);
     menuWrap.appendChild(menu);
     slot.appendChild(saveBtn);
     slot.appendChild(questionsWrap);
-    slot.appendChild(downloadBtn);
     slot.appendChild(menuWrap);
+    slot.appendChild(downloadBtn);
 }
 
 // Persist our own active flag so the taskbar survives navigation/reload. This
