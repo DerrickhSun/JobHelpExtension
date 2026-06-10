@@ -46,6 +46,30 @@ function getLinkedInJobId() {
     return activeRow?.getAttribute("data-occludable-job-id") || null;
 }
 
+function getLinkedInJobUrl() {
+    const jobId = getLinkedInJobId();
+    if (jobId) {
+        return "https://www.linkedin.com/jobs/view/" + jobId + "/";
+    }
+
+    const viewLink = document.querySelector(
+        'a[href*="/jobs/view/"], a[href*="currentJobId"]'
+    );
+    const href = viewLink?.href || "";
+    if (href) {
+        const fromView = href.match(/\/jobs\/view\/(\d+)/i);
+        if (fromView) {
+            return "https://www.linkedin.com/jobs/view/" + fromView[1] + "/";
+        }
+        const fromQuery = href.match(/currentJobId=(\d+)/i);
+        if (fromQuery) {
+            return "https://www.linkedin.com/jobs/view/" + fromQuery[1] + "/";
+        }
+    }
+
+    return "";
+}
+
 function getLinkedInCompanyMarker() {
     return document.querySelector('[aria-label^="Company,"], [aria-label*="Company,"]');
 }
@@ -83,6 +107,52 @@ function getLinkedInJobTitleFromModernUI() {
         const text = p.textContent.trim();
         if (!text || looksLikeJobMetadata(text) || text.length > 200) continue;
         return text;
+    }
+
+    return null;
+}
+
+function getLinkedInCompanyFromModernUI() {
+    const marker = getLinkedInCompanyMarker();
+    if (!marker) return null;
+
+    const label = marker.getAttribute("aria-label")?.trim() || "";
+    const fromLabel = label.match(/^Company,\s*(.+)$/i);
+    if (fromLabel) return fromLabel[1].trim();
+
+    const link = marker.closest('[data-display-contents="true"]')
+        ?.querySelector('a[href*="/company/"]');
+    return link?.textContent?.trim() || null;
+}
+
+// Selectors aligned with job_searcher.py (SEL + parse_current_job_from_detail_pane).
+function getLinkedInJobCompany() {
+    if (!isLinkedInJobDisplayed()) return null;
+
+    const modernCompany = getLinkedInCompanyFromModernUI();
+    if (modernCompany) return modernCompany;
+
+    const detailCompany = textFromFirstMatch(document, [
+        ".job-details-jobs-unified-top-card__company-name a",
+        ".jobs-unified-top-card__company-name a",
+        ".jobs-unified-top-card__company-name",
+        "a[class*='company-name']",
+    ]);
+    if (detailCompany) return detailCompany;
+
+    const activeRow = document.querySelector(
+        "li.scaffold-layout__list-item--active," +
+        "li.jobs-search-results__list-item--active," +
+        'li[aria-current="true"]'
+    );
+    if (activeRow) {
+        const rowCompany = textFromFirstMatch(activeRow, [
+            '[class*="job-card-job-posting-card-wrapper__company-name"]',
+            '[class*="job-card-job-posting-card-wrapper__primary-description"]',
+            ".artdeco-entity-lockup__subtitle span[dir='ltr']",
+            ".artdeco-entity-lockup__subtitle span",
+        ]);
+        if (rowCompany) return rowCompany;
     }
 
     return null;
@@ -127,9 +197,35 @@ function getLinkedInJobTitle() {
     return null;
 }
 
-function getJobTitleForSave() {
+function getJobForSave() {
     if (!isLinkedInPage()) return null;
-    return getLinkedInJobTitle();
+
+    const title = getLinkedInJobTitle();
+    if (!title) return null;
+
+    return {
+        title,
+        company: getLinkedInJobCompany() || "",
+        url: getLinkedInJobUrl(),
+    };
+}
+
+function formatSavedJobLabel(job) {
+    const title = job.title || "";
+    const company = job.company || "";
+    if (company) return company + ", " + title;
+    return title;
+}
+
+function formatSavedJobDownloadLine(job) {
+    const company = job.company || "";
+    const title = job.title || "";
+    const url = job.url || "";
+    return company + ", " + title + ", " + url;
+}
+
+function savedJobKey(job) {
+    return (job.company || "") + "\0" + (job.title || "");
 }
 
 const browser = globalThis.browser ?? globalThis.chrome;
@@ -143,8 +239,8 @@ let savedMenuHoverCloseTimer = null;
 let saveButtonRefreshTimer = null;
 
 function updateSaveButtonState(saveBtn) {
-    const title = getJobTitleForSave();
-    if (title) {
+    const job = getJobForSave();
+    if (job) {
         saveBtn.disabled = false;
         saveBtn.textContent = "Save job";
     } else {
@@ -176,23 +272,30 @@ async function getSavedJobs() {
     return stored[SAVED_JOBS_KEY] || [];
 }
 
-async function addSavedJob(title) {
+async function addSavedJob(job) {
     const savedJobs = await getSavedJobs();
-    const entry = { title, savedAt: Date.now() };
-    const withoutDup = savedJobs.filter((job) => job.title !== title);
+    const entry = {
+        title: job.title,
+        company: job.company || "",
+        url: job.url || "",
+        savedAt: Date.now(),
+    };
+    const key = savedJobKey(entry);
+    const withoutDup = savedJobs.filter((saved) => savedJobKey(saved) !== key);
     withoutDup.unshift(entry);
     await browser.storage.local.set({ [SAVED_JOBS_KEY]: withoutDup });
 }
 
-async function removeSavedJob(title) {
+async function removeSavedJob(job) {
     const savedJobs = await getSavedJobs();
-    const filtered = savedJobs.filter((job) => job.title !== title);
+    const key = savedJobKey(job);
+    const filtered = savedJobs.filter((saved) => savedJobKey(saved) !== key);
     await browser.storage.local.set({ [SAVED_JOBS_KEY]: filtered });
 }
 
 async function downloadAllSavedJobs() {
     const jobs = await getSavedJobs();
-    const text = jobs.map((job) => job.title).join("\n");
+    const text = jobs.map((job) => formatSavedJobDownloadLine(job)).join("\n");
     saveTextFile(text, "saved_jobs.txt");
 }
 
@@ -232,19 +335,21 @@ function renderSavedJobsMenu(menu, jobs, menuRoot) {
         const item = document.createElement("li");
         item.className = "jobhelp-saved-item";
 
+        const label = formatSavedJobLabel(job);
+
         const title = document.createElement("span");
         title.className = "jobhelp-saved-item-title";
-        title.textContent = job.title;
-        title.title = job.title;
+        title.textContent = label;
+        title.title = label;
 
         const removeBtn = document.createElement("button");
         removeBtn.type = "button";
         removeBtn.className = "jobhelp-saved-remove";
-        removeBtn.setAttribute("aria-label", "Remove " + job.title);
+        removeBtn.setAttribute("aria-label", "Remove " + label);
         removeBtn.textContent = "×";
         removeBtn.addEventListener("click", (event) => {
             event.stopPropagation();
-            removeSavedJob(job.title).then(() => {
+            removeSavedJob(job).then(() => {
                 getSavedJobs().then((updated) => {
                     renderSavedJobsMenu(menu, updated, menuRoot);
                     if (!menu.hidden && menuRoot) {
@@ -359,8 +464,8 @@ function buildButtons(slot) {
     const saveBtn = document.createElement("button");
     saveBtn.type = "button";
     saveBtn.addEventListener("click", () => {
-        const title = getJobTitleForSave();
-        if (title) addSavedJob(title);
+        const job = getJobForSave();
+        if (job) addSavedJob(job);
     });
     startSaveButtonRefresh(saveBtn);
 
