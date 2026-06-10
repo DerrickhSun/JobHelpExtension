@@ -149,7 +149,7 @@ function updateSaveButtonState(saveBtn) {
         saveBtn.textContent = "Save job";
     } else {
         saveBtn.disabled = true;
-        saveBtn.textContent = "no job shown";
+        saveBtn.textContent = "No job found";
     }
 }
 
