@@ -127,34 +127,294 @@ function getLinkedInJobTitle() {
     return null;
 }
 
-function getSavePayload() {
-    if (!isLinkedInPage()) {
-        return { text: "Hello world", filename: "hello.txt" };
+function getJobTitleForSave() {
+    if (!isLinkedInPage()) return null;
+    return getLinkedInJobTitle();
+}
+
+const browser = globalThis.browser ?? globalThis.chrome;
+
+const SAVED_JOBS_KEY = "savedJobs";
+const SAVED_MENU_HOVER_CLOSE_MS = 350;
+const SAVED_MENU_VIEWPORT_MARGIN = 8;
+const SAVE_BUTTON_REFRESH_MS = 1000;
+let savedMenuCloseHandler = null;
+let savedMenuHoverCloseTimer = null;
+let saveButtonRefreshTimer = null;
+
+function updateSaveButtonState(saveBtn) {
+    const title = getJobTitleForSave();
+    if (title) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Save job";
+    } else {
+        saveBtn.disabled = true;
+        saveBtn.textContent = "no job shown";
+    }
+}
+
+function stopSaveButtonRefresh() {
+    if (saveButtonRefreshTimer) {
+        clearInterval(saveButtonRefreshTimer);
+        saveButtonRefreshTimer = null;
+    }
+}
+
+function startSaveButtonRefresh(saveBtn) {
+    stopSaveButtonRefresh();
+    updateSaveButtonState(saveBtn);
+    saveButtonRefreshTimer = setInterval(() => updateSaveButtonState(saveBtn), SAVE_BUTTON_REFRESH_MS);
+}
+
+function isInsideSavedMenu(target, menuRoot) {
+    if (!target) return false;
+    return target === menuRoot || menuRoot.contains(target);
+}
+
+async function getSavedJobs() {
+    const stored = await browser.storage.local.get(SAVED_JOBS_KEY);
+    return stored[SAVED_JOBS_KEY] || [];
+}
+
+async function addSavedJob(title) {
+    const savedJobs = await getSavedJobs();
+    const entry = { title, savedAt: Date.now() };
+    const withoutDup = savedJobs.filter((job) => job.title !== title);
+    withoutDup.unshift(entry);
+    await browser.storage.local.set({ [SAVED_JOBS_KEY]: withoutDup });
+}
+
+async function removeSavedJob(title) {
+    const savedJobs = await getSavedJobs();
+    const filtered = savedJobs.filter((job) => job.title !== title);
+    await browser.storage.local.set({ [SAVED_JOBS_KEY]: filtered });
+}
+
+async function downloadAllSavedJobs() {
+    const jobs = await getSavedJobs();
+    const text = jobs.map((job) => job.title).join("\n");
+    saveTextFile(text, "saved_jobs.txt");
+}
+
+function injectSlotStyles(slot) {
+    if (slot.querySelector("style[data-jobhelp]")) return;
+
+    const style = document.createElement("style");
+    style.setAttribute("data-jobhelp", "");
+    style.textContent =
+        ".jobhelp-saved-wrap{position:relative;display:inline-flex;}" +
+        ".jobhelp-saved-menu{position:fixed;min-width:220px;max-width:320px;max-height:240px;" +
+        "overflow:auto;margin:0;padding:4px 0;list-style:none;background:#fff;border:1px solid #ccc;" +
+        "border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:2147483647;font-size:13px;}" +
+        ".jobhelp-saved-menu::before{content:'';position:absolute;left:0;right:0;top:-12px;height:12px;}" +
+        ".jobhelp-saved-item{display:flex;align-items:center;gap:8px;padding:6px 8px 6px 12px;color:#111;}" +
+        ".jobhelp-saved-item-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;" +
+        "white-space:nowrap;}" +
+        ".jobhelp-saved-remove{flex:0 0 auto;border:none;background:transparent;cursor:pointer;" +
+        "color:#666;font-size:16px;line-height:1;padding:2px 6px;border-radius:4px;}" +
+        ".jobhelp-saved-remove:hover{color:#b00020;background:#fde8e8;}" +
+        ".jobhelp-saved-menu li.jobhelp-saved-empty{padding:8px 12px;color:#666;font-style:italic;}" +
+        "button:disabled{opacity:0.55;cursor:not-allowed;}";
+    slot.prepend(style);
+}
+
+function renderSavedJobsMenu(menu, jobs, menuRoot) {
+    menu.replaceChildren();
+    if (!jobs.length) {
+        const empty = document.createElement("li");
+        empty.className = "jobhelp-saved-empty";
+        empty.textContent = "No saved jobs yet";
+        menu.appendChild(empty);
+        return;
     }
 
-    const jobName = getLinkedInJobTitle();
-    if (jobName) {
-        const safeName = jobName.replace(/[<>:"/\\|?*\x00-\x1f]/g, "").trim() || "job";
-        return { text: jobName, filename: safeName + ".txt" };
+    for (const job of jobs) {
+        const item = document.createElement("li");
+        item.className = "jobhelp-saved-item";
+
+        const title = document.createElement("span");
+        title.className = "jobhelp-saved-item-title";
+        title.textContent = job.title;
+        title.title = job.title;
+
+        const removeBtn = document.createElement("button");
+        removeBtn.type = "button";
+        removeBtn.className = "jobhelp-saved-remove";
+        removeBtn.setAttribute("aria-label", "Remove " + job.title);
+        removeBtn.textContent = "×";
+        removeBtn.addEventListener("click", (event) => {
+            event.stopPropagation();
+            removeSavedJob(job.title).then(() => {
+                getSavedJobs().then((updated) => {
+                    renderSavedJobsMenu(menu, updated, menuRoot);
+                    if (!menu.hidden && menuRoot) {
+                        positionSavedJobsMenu(menuRoot, menu);
+                    }
+                });
+            });
+        });
+
+        item.appendChild(title);
+        item.appendChild(removeBtn);
+        menu.appendChild(item);
+    }
+}
+
+function clearSavedMenuHoverCloseTimer() {
+    if (savedMenuHoverCloseTimer) {
+        clearTimeout(savedMenuHoverCloseTimer);
+        savedMenuHoverCloseTimer = null;
+    }
+}
+
+function scheduleSavedMenuHoverClose(menuRoot) {
+    clearSavedMenuHoverCloseTimer();
+    savedMenuHoverCloseTimer = setTimeout(() => {
+        savedMenuHoverCloseTimer = null;
+        closeSavedJobsMenu(menuRoot);
+    }, SAVED_MENU_HOVER_CLOSE_MS);
+}
+
+function resetSavedJobsMenuPosition(menu) {
+    menu.style.left = "";
+    menu.style.top = "";
+    menu.style.visibility = "";
+}
+
+function positionSavedJobsMenu(menuRoot, menu) {
+    const listBtn = menuRoot.querySelector("button");
+    if (!listBtn) return;
+
+    menu.hidden = false;
+    menu.style.visibility = "hidden";
+
+    const btnRect = listBtn.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const margin = SAVED_MENU_VIEWPORT_MARGIN;
+
+    let left = btnRect.left;
+    let top = btnRect.bottom;
+
+    if (left + menuRect.width > window.innerWidth - margin) {
+        left = Math.max(margin, window.innerWidth - menuRect.width - margin);
+    }
+    if (left < margin) {
+        left = margin;
     }
 
-    return { text: "generic linkedin", filename: "generic-linkedin.txt" };
+    if (top + menuRect.height > window.innerHeight - margin) {
+        top = Math.max(margin, btnRect.top - menuRect.height);
+    }
+
+    menu.style.left = left + "px";
+    menu.style.top = top + "px";
+    menu.style.visibility = "";
+}
+
+function closeSavedJobsMenu(menuRoot) {
+    const menu = menuRoot.querySelector(".jobhelp-saved-menu");
+    clearSavedMenuHoverCloseTimer();
+
+    if (menu) {
+        menu.hidden = true;
+        resetSavedJobsMenuPosition(menu);
+    }
+
+    if (savedMenuCloseHandler) {
+        document.removeEventListener("mousedown", savedMenuCloseHandler, true);
+        savedMenuCloseHandler = null;
+    }
+}
+
+function openSavedJobsMenu(menuRoot) {
+    const menu = menuRoot.querySelector(".jobhelp-saved-menu");
+    if (!menu) return;
+
+    clearSavedMenuHoverCloseTimer();
+
+    getSavedJobs().then((jobs) => {
+        renderSavedJobsMenu(menu, jobs, menuRoot);
+        positionSavedJobsMenu(menuRoot, menu);
+
+        if (savedMenuCloseHandler) {
+            document.removeEventListener("mousedown", savedMenuCloseHandler, true);
+        }
+
+        savedMenuCloseHandler = (event) => {
+            const path = event.composedPath();
+            if (path.includes(menuRoot)) return;
+            closeSavedJobsMenu(menuRoot);
+        };
+        document.addEventListener("mousedown", savedMenuCloseHandler, true);
+    });
 }
 
 // Populates our slot with this extension's buttons. Called by the shared module
 // with our slot element (which lives inside the shared taskbar's shadow DOM).
 function buildButtons(slot) {
+    injectSlotStyles(slot);
+    closeSavedJobsMenu(slot);
+    stopSaveButtonRefresh();
+
     const saveBtn = document.createElement("button");
     saveBtn.type = "button";
-    saveBtn.textContent = isLinkedInPage() ? "Save job" : 'Save "Hello world"';
     saveBtn.addEventListener("click", () => {
-        const { text, filename } = getSavePayload();
-        saveTextFile(text, filename);
+        const title = getJobTitleForSave();
+        if (title) addSavedJob(title);
     });
-    slot.appendChild(saveBtn);
-}
+    startSaveButtonRefresh(saveBtn);
 
-const browser = globalThis.browser ?? globalThis.chrome;
+    const downloadBtn = document.createElement("button");
+    downloadBtn.type = "button";
+    downloadBtn.textContent = "Download jobs";
+    downloadBtn.addEventListener("click", () => {
+        downloadAllSavedJobs();
+    });
+
+    const menuWrap = document.createElement("div");
+    menuWrap.className = "jobhelp-saved-wrap";
+
+    const listBtn = document.createElement("button");
+    listBtn.type = "button";
+    listBtn.textContent = "Saved jobs";
+    listBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        const menu = menuWrap.querySelector(".jobhelp-saved-menu");
+        if (menu && !menu.hidden) {
+            closeSavedJobsMenu(menuWrap);
+        } else {
+            openSavedJobsMenu(menuWrap);
+        }
+    });
+
+    const menu = document.createElement("ul");
+    menu.className = "jobhelp-saved-menu";
+    menu.hidden = true;
+
+    const cancelHoverClose = () => clearSavedMenuHoverCloseTimer();
+
+    menuWrap.addEventListener("mouseenter", cancelHoverClose);
+    menu.addEventListener("mouseenter", cancelHoverClose);
+
+    menuWrap.addEventListener("mouseleave", (event) => {
+        if (!isInsideSavedMenu(event.relatedTarget, menuWrap) &&
+            !isInsideSavedMenu(event.relatedTarget, menu)) {
+            scheduleSavedMenuHoverClose(menuWrap);
+        }
+    });
+    menu.addEventListener("mouseleave", (event) => {
+        if (!isInsideSavedMenu(event.relatedTarget, menuWrap) &&
+            !isInsideSavedMenu(event.relatedTarget, menu)) {
+            scheduleSavedMenuHoverClose(menuWrap);
+        }
+    });
+
+    menuWrap.appendChild(listBtn);
+    menuWrap.appendChild(menu);
+    slot.appendChild(saveBtn);
+    slot.appendChild(downloadBtn);
+    slot.appendChild(menuWrap);
+}
 
 // Persist our own active flag so the taskbar survives navigation/reload. This
 // is per-extension storage; the other sharing extension persists its slot
@@ -166,6 +426,7 @@ function showTaskbar() {
 }
 
 function hideTaskbar() {
+  stopSaveButtonRefresh();
   unregisterTaskbar(EXT_KEY);
 }
 
