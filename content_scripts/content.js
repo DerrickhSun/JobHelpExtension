@@ -10,19 +10,13 @@ const EXT_KEY = "jobhelp";
 // appear SECOND, so this must be greater than the other extension's order.
 const TASKBAR_ORDER = 20;
 
-// Triggers a file download from the page context via a temporary <a download>.
-// This works in both Chrome and Firefox, unlike downloads.download with a
-// data:/blob: URL (Firefox rejects those outright).
+// Uses the downloads API so repeated exports overwrite the same filename.
 function saveTextFile(text, filename) {
-    const blob = new Blob([text], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+    return browser.runtime.sendMessage({
+        type: "DOWNLOAD_TEXT_FILE",
+        text,
+        filename,
+    });
 }
 
 function isLinkedInPage() {
@@ -228,14 +222,422 @@ function savedJobKey(job) {
     return (job.company || "") + "\0" + (job.title || "");
 }
 
+function trimLinkedInFieldLabel(text) {
+    return (text || "").trim().replace(/\s*\*+\s*$/, "").trim();
+}
+
+function isVisibleElement(el) {
+    if (!el) return false;
+    if (el.closest('[aria-hidden="true"]')) return false;
+
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0 || el.getClientRects().length > 0;
+}
+
+function isLinkedInFormControlVisible(el) {
+    if (!el || el.disabled) return false;
+    if (el.type === "hidden") return false;
+    return isVisibleElement(el);
+}
+
+function collectSearchRoots(start) {
+    const roots = [start];
+    const queue = [start];
+    while (queue.length) {
+        const node = queue.shift();
+        node.querySelectorAll("*").forEach((el) => {
+            if (el.shadowRoot) {
+                roots.push(el.shadowRoot);
+                queue.push(el.shadowRoot);
+            }
+        });
+    }
+    return roots;
+}
+
+function queryAllInDocument(selector) {
+    const seen = new Set();
+    const results = [];
+    for (const root of collectSearchRoots(document)) {
+        root.querySelectorAll(selector).forEach((el) => {
+            if (seen.has(el)) return;
+            seen.add(el);
+            results.push(el);
+        });
+    }
+    return results;
+}
+
+function findLinkedInEasyApplyMarker() {
+    const selectors = [
+        '[data-test-single-line-text-form-component]',
+        '[data-test-multiline-text-form-component]',
+        'input[id*="easyApplyFormElement"]',
+        'textarea[id*="easyApplyFormElement"]',
+        'select[id*="easyApplyFormElement"]',
+        'fieldset[data-test-form-builder-radio-button-form-component="true"]',
+    ];
+    for (const selector of selectors) {
+        const el = document.querySelector(selector);
+        if (el && isVisibleElement(el)) return el;
+    }
+
+    for (const selector of selectors) {
+        const matches = queryAllInDocument(selector);
+        const visible = matches.find((el) => isVisibleElement(el));
+        if (visible) return visible;
+    }
+
+    return null;
+}
+
+function getLinkedInApplicationRoot() {
+    const containerSelectors = [
+        ".jobs-easy-apply-modal",
+        ".jobs-easy-apply-content",
+        '[data-test-modal][class*="easy-apply"]',
+    ];
+
+    for (const selector of containerSelectors) {
+        const el = document.querySelector(selector);
+        if (el && isVisibleElement(el)) return el;
+    }
+
+    const marker = findLinkedInEasyApplyMarker();
+    if (!marker) return null;
+
+    const dialog = marker.closest(
+        '.jobs-easy-apply-modal, .jobs-easy-apply-content, [role="dialog"], .artdeco-modal'
+    );
+    if (dialog && isVisibleElement(dialog)) return dialog;
+
+    const formBlocks = queryAllInDocument("[data-test-form-element]").filter((block) => {
+        return isVisibleElement(block) && isLinkedInEasyApplyFormBlock(block);
+    });
+    if (!formBlocks.length) return null;
+
+    let ancestor = formBlocks[0];
+    while (ancestor) {
+        if (formBlocks.every((block) => ancestor.contains(block))) {
+            return ancestor;
+        }
+        ancestor = ancestor.parentElement;
+    }
+
+    return formBlocks[0];
+}
+
+function getLinkedInEasyApplyModal() {
+    return getLinkedInApplicationRoot();
+}
+
+function isLinkedInApplicationOpen() {
+    return !!getLinkedInApplicationRoot();
+}
+
+function isLinkedInEasyApplyFormBlock(block) {
+    if (block.querySelector('[id*="easyApplyFormElement"]')) return true;
+    if (block.querySelector("[data-test-single-line-text-form-component]")) return true;
+    if (block.querySelector("[data-test-multiline-text-form-component]")) return true;
+    if (block.querySelector('[data-test-form-builder-radio-button-form-component]')) return true;
+    if (block.querySelector('fieldset[data-test-form-builder-radio-button-form-component="true"]')) return true;
+    if (block.closest(".jobs-easy-apply-modal, .jobs-easy-apply-content")) return true;
+    return false;
+}
+
+function getLinkedInFormFieldLabel(element, scope) {
+    const searchRoot = scope || element?.ownerDocument || document;
+
+    const elId = element.id;
+    if (elId) {
+        const label = searchRoot.querySelector('label[for="' + CSS.escape(elId) + '"]');
+        const fromLabel = trimLinkedInFieldLabel(label?.textContent);
+        if (fromLabel) return fromLabel;
+    }
+
+    const aria = trimLinkedInFieldLabel(element.getAttribute("aria-label"));
+    if (aria) return aria;
+
+    const placeholder = (element.getAttribute("placeholder") || "").trim();
+    if (placeholder) return placeholder;
+
+    return "";
+}
+
+function getLabelFromFormElementBlock(block, control) {
+    if (control?.id) {
+        const scopedLabel = block.querySelector('label[for="' + CSS.escape(control.id) + '"]');
+        const scopedText = trimLinkedInFieldLabel(scopedLabel?.textContent);
+        if (scopedText) return scopedText;
+    }
+
+    for (const selector of [
+        "label.artdeco-text-input--label",
+        "[data-test-form-builder-radio-button-form-component__title]",
+        "legend .fb-dash-form-element__label",
+        "legend",
+        "label",
+    ]) {
+        const label = block.querySelector(selector);
+        const text = trimLinkedInFieldLabel(label?.textContent);
+        if (text) return text;
+    }
+
+    return getLinkedInFormFieldLabel(control, block);
+}
+
+function getLinkedInRadioFieldsetLabel(fieldset) {
+    const selectors = [
+        "[data-test-form-builder-radio-button-form-component__title]",
+        "legend .fb-dash-form-element__label",
+        "legend",
+    ];
+    for (const selector of selectors) {
+        const el = fieldset.querySelector(selector);
+        const text = el?.textContent?.trim();
+        if (text) return text;
+    }
+    return "";
+}
+
+function getLinkedInRadioFieldsetAnswer(fieldset) {
+    const selected = fieldset.querySelector('input[type="radio"]:checked');
+    if (!selected) return "";
+
+    const rid = selected.id;
+    if (rid) {
+        const lab = fieldset.querySelector('label[for="' + CSS.escape(rid) + '"]') ||
+            document.querySelector('label[for="' + CSS.escape(rid) + '"]');
+        const labelText = lab?.textContent?.trim();
+        if (labelText) return labelText;
+    }
+
+    const opt = selected.closest("[data-test-text-selectable-option]");
+    if (opt) {
+        const lab = opt.querySelector("[data-test-text-selectable-option__label]");
+        if (lab) {
+            const attr = lab.getAttribute("data-test-text-selectable-option__label");
+            if (attr?.trim()) return attr.trim();
+            const text = lab.textContent?.trim();
+            if (text) return text;
+        }
+    }
+
+    return (selected.value || "").trim();
+}
+
+function getLinkedInSelectAnswer(select) {
+    const opt = select.options[select.selectedIndex];
+    if (!opt) return "";
+    const text = opt.textContent?.trim() || "";
+    if (text && !/^(select an option|select)$/i.test(text)) return text;
+    return (opt.value || "").trim();
+}
+
+function getLinkedInRadioGroupAnswer(modal, name) {
+    const selected = modal.querySelector(
+        'input[type="radio"][name="' + CSS.escape(name) + '"]:checked'
+    );
+    if (!selected) return "";
+
+    const rid = selected.id;
+    if (rid) {
+        const lab = modal.querySelector('label[for="' + CSS.escape(rid) + '"]');
+        const labelText = lab?.textContent?.trim();
+        if (labelText) return labelText;
+    }
+
+    return (selected.value || "").trim();
+}
+
+function getLinkedInRadioGroupLabel(modal, firstRadio) {
+    try {
+        const fieldset = firstRadio.closest("fieldset");
+        if (fieldset) {
+            const fromFieldset = getLinkedInRadioFieldsetLabel(fieldset);
+            if (fromFieldset) return fromFieldset;
+        }
+    } catch (_) {
+        // ignore
+    }
+
+    const wrap = firstRadio.closest(
+        ".jobs-easy-apply-form-element, [class*='fb-dash']"
+    );
+    if (wrap) {
+        const text = wrap.textContent?.trim();
+        if (text) return text;
+    }
+
+    return nameFromRadioGroup(firstRadio.getAttribute("name") || "");
+}
+
+function nameFromRadioGroup(name) {
+    return (name || "").replace(/[_-]+/g, " ").trim();
+}
+
+function collectLinkedInFormElementBlocks(root) {
+    const blocks = [];
+    const seen = new Set();
+
+    function addBlock(block) {
+        if (!block || seen.has(block)) return;
+        if (!isLinkedInEasyApplyFormBlock(block)) return;
+        if (!isVisibleElement(block)) return;
+        seen.add(block);
+        blocks.push(block);
+    }
+
+    if (root) {
+        root.querySelectorAll("[data-test-form-element]").forEach(addBlock);
+    }
+
+    if (!blocks.length) {
+        queryAllInDocument("[data-test-form-element]").forEach(addBlock);
+    }
+
+    return blocks;
+}
+
+function scanLinkedInFormElementBlock(block) {
+    const fieldset = block.querySelector(
+        'fieldset[data-test-form-builder-radio-button-form-component="true"]'
+    );
+    if (fieldset) {
+        return {
+            question: getLabelFromFormElementBlock(block, fieldset) ||
+                getLinkedInRadioFieldsetLabel(fieldset),
+            answer: getLinkedInRadioFieldsetAnswer(fieldset),
+            fieldType: "radio",
+        };
+    }
+
+    const textarea = block.querySelector("textarea");
+    if (textarea && isLinkedInFormControlVisible(textarea)) {
+        return {
+            question: getLabelFromFormElementBlock(block, textarea),
+            answer: textarea.value,
+            fieldType: "textarea",
+        };
+    }
+
+    const select = block.querySelector("select");
+    if (select && isLinkedInFormControlVisible(select)) {
+        return {
+            question: getLabelFromFormElementBlock(block, select),
+            answer: getLinkedInSelectAnswer(select),
+            fieldType: "select",
+        };
+    }
+
+    const input = block.querySelector(
+        "input.artdeco-text-input--input, " +
+        "input[type='text'], input[type='number'], input[type='tel'], " +
+        'input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]):not([type="file"])'
+    );
+    if (input && isLinkedInFormControlVisible(input)) {
+        return {
+            question: getLabelFromFormElementBlock(block, input),
+            answer: input.value,
+            fieldType: "text",
+        };
+    }
+
+    return null;
+}
+
+// Mirrors form_filler.py field selectors; prefers LinkedIn data-test-form-element blocks.
+function scanLinkedInApplicationFields(root) {
+    const pairs = [];
+    const seenQuestions = new Set();
+    const handledRadioNames = new Set();
+
+    function addPair(question, answer, fieldType) {
+        const q = (question || "").trim();
+        if (!q || seenQuestions.has(q)) return;
+        seenQuestions.add(q);
+        pairs.push({
+            question: q,
+            answer: (answer || "").trim(),
+            fieldType: fieldType || "",
+        });
+    }
+
+    for (const block of collectLinkedInFormElementBlocks(root)) {
+        const scanned = scanLinkedInFormElementBlock(block);
+        if (scanned) addPair(scanned.question, scanned.answer, scanned.fieldType);
+    }
+
+    if (pairs.length) return pairs;
+
+    const modal = root || document;
+    modal.querySelectorAll(
+        "input[type='text'], input[type='number'], input[type='tel'], input.artdeco-text-input--input"
+    ).forEach((el) => {
+        if (!isLinkedInFormControlVisible(el)) return;
+        if (!el.id?.includes("easyApplyFormElement")) return;
+        addPair(getLinkedInFormFieldLabel(el, modal), el.value, "text");
+    });
+
+    modal.querySelectorAll("textarea").forEach((el) => {
+        if (!isLinkedInFormControlVisible(el)) return;
+        if (!el.id?.includes("easyApplyFormElement")) return;
+        addPair(getLinkedInFormFieldLabel(el, modal), el.value, "textarea");
+    });
+
+    modal.querySelectorAll("select").forEach((el) => {
+        if (!isLinkedInFormControlVisible(el)) return;
+        if (!el.id?.includes("easyApplyFormElement")) return;
+        addPair(getLinkedInFormFieldLabel(el, modal), getLinkedInSelectAnswer(el), "select");
+    });
+
+    modal.querySelectorAll(
+        'fieldset[data-test-form-builder-radio-button-form-component="true"]'
+    ).forEach((fieldset) => {
+        const radios = fieldset.querySelectorAll('input[type="radio"]');
+        if (!radios.length) return;
+        const name = radios[0].getAttribute("name");
+        if (name) handledRadioNames.add(name);
+        addPair(
+            getLinkedInRadioFieldsetLabel(fieldset),
+            getLinkedInRadioFieldsetAnswer(fieldset),
+            "radio"
+        );
+    });
+
+    const radiosByName = new Map();
+    modal.querySelectorAll('input[type="radio"]').forEach((radio) => {
+        if (!isLinkedInFormControlVisible(radio)) return;
+        const name = radio.getAttribute("name");
+        if (!name || handledRadioNames.has(name)) return;
+        if (!radiosByName.has(name)) radiosByName.set(name, radio);
+    });
+
+    for (const [name, firstRadio] of radiosByName) {
+        addPair(
+            getLinkedInRadioGroupLabel(modal, firstRadio),
+            getLinkedInRadioGroupAnswer(modal, name),
+            "radio"
+        );
+    }
+
+    return pairs;
+}
+
 const browser = globalThis.browser ?? globalThis.chrome;
 
 const SAVED_JOBS_KEY = "savedJobs";
+const SAVED_APPLICATION_QUESTIONS_KEY = "savedApplicationQuestions";
 const SAVED_MENU_HOVER_CLOSE_MS = 350;
 const SAVED_MENU_VIEWPORT_MARGIN = 8;
+const SAVED_QUESTION_PREVIEW_LENGTH = 30;
 const SAVE_BUTTON_REFRESH_MS = 1000;
 let savedMenuCloseHandler = null;
 let savedMenuHoverCloseTimer = null;
+let questionsMenuHoverCloseTimer = null;
 let saveButtonRefreshTimer = null;
 
 function updateSaveButtonState(saveBtn) {
@@ -267,6 +669,142 @@ function isInsideSavedMenu(target, menuRoot) {
     return target === menuRoot || menuRoot.contains(target);
 }
 
+function isInsideQuestionsMenu(target, menuRoot, menu) {
+    if (!target) return false;
+    return target === menuRoot || menuRoot.contains(target) ||
+        target === menu || menu.contains(target);
+}
+
+function renderSavedQuestionsMenu(menu, questions, menuRoot) {
+    menu.replaceChildren();
+    if (!questions.length) {
+        const empty = document.createElement("li");
+        empty.className = "jobhelp-questions-empty";
+        empty.textContent = "No questions saved yet";
+        menu.appendChild(empty);
+        return;
+    }
+
+    for (const entry of questions) {
+        const item = document.createElement("li");
+        item.className = "jobhelp-questions-item";
+
+        const fullQuestion = entry.question || "";
+        const preview = formatSavedQuestionPreview(fullQuestion);
+
+        const title = document.createElement("span");
+        title.className = "jobhelp-questions-item-title";
+        title.textContent = preview;
+        title.title = fullQuestion;
+
+        const removeBtn = document.createElement("button");
+        removeBtn.type = "button";
+        removeBtn.className = "jobhelp-saved-remove";
+        removeBtn.setAttribute("aria-label", "Remove " + fullQuestion);
+        removeBtn.textContent = "×";
+        removeBtn.addEventListener("click", (event) => {
+            event.stopPropagation();
+            removeSavedApplicationQuestion(entry).then(() => {
+                getSavedApplicationQuestions().then((updated) => {
+                    const btn = menuRoot?.querySelector(".jobhelp-questions-count");
+                    if (!updated.length) {
+                        closeSavedQuestionsMenu(menuRoot);
+                    }
+                    if (btn) {
+                        updateSavedQuestionsCountBtn(btn, menuRoot);
+                    } else if (!updated.length) {
+                        return;
+                    } else {
+                        renderSavedQuestionsMenu(menu, updated, menuRoot);
+                        if (!menu.hidden && menuRoot) {
+                            positionSavedQuestionsMenu(menuRoot, menu);
+                        }
+                    }
+                });
+            });
+        });
+
+        item.appendChild(title);
+        item.appendChild(removeBtn);
+        menu.appendChild(item);
+    }
+}
+
+function clearQuestionsMenuHoverCloseTimer() {
+    if (questionsMenuHoverCloseTimer) {
+        clearTimeout(questionsMenuHoverCloseTimer);
+        questionsMenuHoverCloseTimer = null;
+    }
+}
+
+function scheduleQuestionsMenuHoverClose(menuRoot) {
+    clearQuestionsMenuHoverCloseTimer();
+    questionsMenuHoverCloseTimer = setTimeout(() => {
+        questionsMenuHoverCloseTimer = null;
+        closeSavedQuestionsMenu(menuRoot);
+    }, SAVED_MENU_HOVER_CLOSE_MS);
+}
+
+function resetSavedQuestionsMenuPosition(menu) {
+    menu.style.left = "";
+    menu.style.top = "";
+    menu.style.visibility = "";
+}
+
+function positionSavedQuestionsMenu(menuRoot, menu) {
+    const listBtn = menuRoot.querySelector("button");
+    if (!listBtn) return;
+
+    menu.hidden = false;
+    menu.style.visibility = "hidden";
+
+    const btnRect = listBtn.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const margin = SAVED_MENU_VIEWPORT_MARGIN;
+
+    let left = btnRect.left;
+    let top = btnRect.bottom;
+
+    if (left + menuRect.width > window.innerWidth - margin) {
+        left = Math.max(margin, window.innerWidth - menuRect.width - margin);
+    }
+    if (left < margin) {
+        left = margin;
+    }
+
+    if (top + menuRect.height > window.innerHeight - margin) {
+        top = Math.max(margin, btnRect.top - menuRect.height);
+    }
+
+    menu.style.left = left + "px";
+    menu.style.top = top + "px";
+    menu.style.visibility = "";
+}
+
+function closeSavedQuestionsMenu(menuRoot) {
+    const menu = menuRoot.querySelector(".jobhelp-questions-menu");
+    clearQuestionsMenuHoverCloseTimer();
+
+    if (menu) {
+        menu.hidden = true;
+        resetSavedQuestionsMenuPosition(menu);
+    }
+}
+
+function openSavedQuestionsMenu(menuRoot) {
+    const menu = menuRoot.querySelector(".jobhelp-questions-menu");
+    if (!menu) return;
+
+    clearQuestionsMenuHoverCloseTimer();
+
+    getSavedApplicationQuestions().then((questions) => {
+        if (!questions.length) return;
+
+        renderSavedQuestionsMenu(menu, questions, menuRoot);
+        positionSavedQuestionsMenu(menuRoot, menu);
+    });
+}
+
 async function getSavedJobs() {
     const stored = await browser.storage.local.get(SAVED_JOBS_KEY);
     return stored[SAVED_JOBS_KEY] || [];
@@ -293,10 +831,120 @@ async function removeSavedJob(job) {
     await browser.storage.local.set({ [SAVED_JOBS_KEY]: filtered });
 }
 
+async function getSavedApplicationQuestions() {
+    const stored = await browser.storage.local.get(SAVED_APPLICATION_QUESTIONS_KEY);
+    return stored[SAVED_APPLICATION_QUESTIONS_KEY] || [];
+}
+
+function applicationQuestionKey(entry) {
+    return (
+        (entry.company || "") + "\0" +
+        (entry.title || "") + "\0" +
+        (entry.question || "")
+    );
+}
+
+async function addSavedApplicationQuestions(pairs, job) {
+    if (!pairs.length) return;
+
+    const savedQuestions = await getSavedApplicationQuestions();
+    const byKey = new Map(
+        savedQuestions.map((entry) => [applicationQuestionKey(entry), entry])
+    );
+    const savedAt = Date.now();
+
+    for (const pair of pairs) {
+        const entry = {
+            question: pair.question,
+            answer: pair.answer,
+            fieldType: pair.fieldType || "",
+            company: job.company || "",
+            title: job.title || "",
+            url: job.url || "",
+            savedAt,
+        };
+        byKey.set(applicationQuestionKey(entry), entry);
+    }
+
+    await browser.storage.local.set({
+        [SAVED_APPLICATION_QUESTIONS_KEY]: [...byKey.values()],
+    });
+}
+
+async function clearSavedApplicationQuestions() {
+    await browser.storage.local.set({ [SAVED_APPLICATION_QUESTIONS_KEY]: [] });
+}
+
+async function removeSavedApplicationQuestion(entry) {
+    const savedQuestions = await getSavedApplicationQuestions();
+    const key = applicationQuestionKey(entry);
+    const filtered = savedQuestions.filter(
+        (saved) => applicationQuestionKey(saved) !== key
+    );
+    await browser.storage.local.set({ [SAVED_APPLICATION_QUESTIONS_KEY]: filtered });
+}
+
+function formatApplicationQuestionsDownloadLine(entry) {
+    const headerParts = [];
+    if (entry.company) headerParts.push(entry.company);
+    if (entry.title) headerParts.push(entry.title);
+    const header = headerParts.length ? headerParts.join(", ") : "Application";
+    const lines = [header];
+    if (entry.url) lines.push("URL: " + entry.url);
+    lines.push("Q: " + (entry.question || ""));
+    lines.push("A: " + (entry.answer || ""));
+    return lines.join("\n");
+}
+
+function formatApplicationQuestionsDownloadText(questions) {
+    return questions.map((entry) => formatApplicationQuestionsDownloadLine(entry)).join("\n\n");
+}
+
+function formatSavedQuestionsCountLabel(count) {
+    if (!count) return "No questions saved";
+    if (count === 1) return "1 question saved";
+    return count + " questions saved";
+}
+
+function formatSavedQuestionPreview(question) {
+    const text = (question || "").trim();
+    if (text.length <= SAVED_QUESTION_PREVIEW_LENGTH) return text;
+    return text.slice(0, SAVED_QUESTION_PREVIEW_LENGTH) + "…";
+}
+
+function updateSavedQuestionsCountBtn(btn, menuRoot) {
+    getSavedApplicationQuestions().then((questions) => {
+        btn.textContent = formatSavedQuestionsCountLabel(questions.length);
+        btn.title = questions.length
+            ? "Hover to preview questions; click to clear"
+            : "Save a job while Easy Apply is open to capture questions";
+
+        if (!menuRoot) return;
+
+        const menu = menuRoot.querySelector(".jobhelp-questions-menu");
+        if (!questions.length) {
+            closeSavedQuestionsMenu(menuRoot);
+            return;
+        }
+        if (menu && !menu.hidden) {
+            renderSavedQuestionsMenu(menu, questions, menuRoot);
+            positionSavedQuestionsMenu(menuRoot, menu);
+        }
+    });
+}
+
 async function downloadAllSavedJobs() {
     const jobs = await getSavedJobs();
     const text = jobs.map((job) => formatSavedJobDownloadLine(job)).join("\n");
-    saveTextFile(text, "saved_jobs.txt");
+    await saveTextFile(text, "saved_jobs.txt");
+
+    const questions = await getSavedApplicationQuestions();
+    if (questions.length) {
+        await saveTextFile(
+            formatApplicationQuestionsDownloadText(questions),
+            "job_application_questions.txt"
+        );
+    }
 }
 
 function injectSlotStyles(slot) {
@@ -305,18 +953,23 @@ function injectSlotStyles(slot) {
     const style = document.createElement("style");
     style.setAttribute("data-jobhelp", "");
     style.textContent =
-        ".jobhelp-saved-wrap{position:relative;display:inline-flex;}" +
-        ".jobhelp-saved-menu{position:fixed;min-width:220px;max-width:320px;max-height:240px;" +
-        "overflow:auto;margin:0;padding:4px 0;list-style:none;background:#fff;border:1px solid #ccc;" +
-        "border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:2147483647;font-size:13px;}" +
-        ".jobhelp-saved-menu::before{content:'';position:absolute;left:0;right:0;top:-12px;height:12px;}" +
-        ".jobhelp-saved-item{display:flex;align-items:center;gap:8px;padding:6px 8px 6px 12px;color:#111;}" +
-        ".jobhelp-saved-item-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;" +
-        "white-space:nowrap;}" +
+        ".jobhelp-saved-wrap,.jobhelp-questions-wrap{position:relative;display:inline-flex;}" +
+        ".jobhelp-saved-menu,.jobhelp-questions-menu{position:fixed;min-width:220px;max-width:320px;" +
+        "max-height:240px;overflow:auto;margin:0;padding:4px 0;list-style:none;background:#fff;" +
+        "border:1px solid #ccc;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.15);" +
+        "z-index:2147483647;font-size:13px;}" +
+        ".jobhelp-saved-menu::before,.jobhelp-questions-menu::before{content:'';position:absolute;" +
+        "left:0;right:0;top:-12px;height:12px;}" +
+        ".jobhelp-saved-item,.jobhelp-questions-item{display:flex;align-items:center;gap:8px;" +
+        "padding:6px 8px 6px 12px;color:#111;}" +
+        ".jobhelp-saved-item-title,.jobhelp-questions-item-title{flex:1 1 auto;min-width:0;" +
+        "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}" +
         ".jobhelp-saved-remove{flex:0 0 auto;border:none;background:transparent;cursor:pointer;" +
         "color:#666;font-size:16px;line-height:1;padding:2px 6px;border-radius:4px;}" +
         ".jobhelp-saved-remove:hover{color:#b00020;background:#fde8e8;}" +
-        ".jobhelp-saved-menu li.jobhelp-saved-empty{padding:8px 12px;color:#666;font-style:italic;}" +
+        ".jobhelp-saved-menu li.jobhelp-saved-empty,.jobhelp-questions-menu li.jobhelp-questions-empty{" +
+        "padding:8px 12px;color:#666;font-style:italic;}" +
+        ".jobhelp-questions-count{cursor:pointer;}" +
         "button:disabled{opacity:0.55;cursor:not-allowed;}";
     slot.prepend(style);
 }
@@ -459,15 +1112,75 @@ function openSavedJobsMenu(menuRoot) {
 function buildButtons(slot) {
     injectSlotStyles(slot);
     closeSavedJobsMenu(slot);
+    slot.querySelectorAll(".jobhelp-questions-wrap").forEach(closeSavedQuestionsMenu);
+    clearQuestionsMenuHoverCloseTimer();
     stopSaveButtonRefresh();
 
     const saveBtn = document.createElement("button");
     saveBtn.type = "button";
-    saveBtn.addEventListener("click", () => {
+    saveBtn.addEventListener("click", async () => {
         const job = getJobForSave();
-        if (job) addSavedJob(job);
+        if (!job) return;
+
+        await addSavedJob(job);
+
+        const applicationRoot = getLinkedInApplicationRoot();
+        if (applicationRoot || findLinkedInEasyApplyMarker()) {
+            const pairs = scanLinkedInApplicationFields(applicationRoot || document);
+            await addSavedApplicationQuestions(pairs, job);
+            updateSavedQuestionsCountBtn(questionsBtn, questionsWrap);
+        }
     });
     startSaveButtonRefresh(saveBtn);
+
+    const questionsWrap = document.createElement("div");
+    questionsWrap.className = "jobhelp-questions-wrap";
+
+    const questionsBtn = document.createElement("button");
+    questionsBtn.type = "button";
+    questionsBtn.className = "jobhelp-questions-count";
+    questionsBtn.addEventListener("click", async () => {
+        const questions = await getSavedApplicationQuestions();
+        if (!questions.length) return;
+
+        const confirmed = window.confirm(
+            "Clear all " + questions.length + " saved application question" +
+            (questions.length === 1 ? "" : "s") + "?"
+        );
+        if (!confirmed) return;
+
+        await clearSavedApplicationQuestions();
+        updateSavedQuestionsCountBtn(questionsBtn, questionsWrap);
+        closeSavedQuestionsMenu(questionsWrap);
+    });
+    updateSavedQuestionsCountBtn(questionsBtn, questionsWrap);
+
+    const questionsMenu = document.createElement("ul");
+    questionsMenu.className = "jobhelp-questions-menu";
+    questionsMenu.hidden = true;
+
+    const cancelQuestionsHoverClose = () => clearQuestionsMenuHoverCloseTimer();
+
+    questionsWrap.addEventListener("mouseenter", () => {
+        cancelQuestionsHoverClose();
+        openSavedQuestionsMenu(questionsWrap);
+    });
+
+    questionsWrap.addEventListener("mouseleave", (event) => {
+        if (!isInsideQuestionsMenu(event.relatedTarget, questionsWrap, questionsMenu)) {
+            scheduleQuestionsMenuHoverClose(questionsWrap);
+        }
+    });
+
+    questionsMenu.addEventListener("mouseenter", cancelQuestionsHoverClose);
+    questionsMenu.addEventListener("mouseleave", (event) => {
+        if (!isInsideQuestionsMenu(event.relatedTarget, questionsWrap, questionsMenu)) {
+            scheduleQuestionsMenuHoverClose(questionsWrap);
+        }
+    });
+
+    questionsWrap.appendChild(questionsBtn);
+    questionsWrap.appendChild(questionsMenu);
 
     const downloadBtn = document.createElement("button");
     downloadBtn.type = "button";
@@ -517,6 +1230,7 @@ function buildButtons(slot) {
     menuWrap.appendChild(listBtn);
     menuWrap.appendChild(menu);
     slot.appendChild(saveBtn);
+    slot.appendChild(questionsWrap);
     slot.appendChild(downloadBtn);
     slot.appendChild(menuWrap);
 }
