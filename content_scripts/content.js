@@ -211,11 +211,25 @@ function formatSavedJobLabel(job) {
     return title;
 }
 
+function formatSavedJobDate(job) {
+    const ts = job.savedAt;
+    if (!ts) return "";
+
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return "";
+
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return year + "-" + month + "-" + day;
+}
+
 function formatSavedJobDownloadLine(job) {
     const company = job.company || "";
+    const date = formatSavedJobDate(job);
     const title = job.title || "";
     const url = job.url || "";
-    return company + ", " + title + ", " + url;
+    return company + ", " + date + ", " + title + ", " + url;
 }
 
 function savedJobKey(job) {
