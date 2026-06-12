@@ -226,6 +226,18 @@ function trimLinkedInFieldLabel(text) {
     return (text || "").trim().replace(/\s*\*+\s*$/, "").trim();
 }
 
+// Prefer innerText (rendered spacing) over textContent — LinkedIn often splits
+// question copy across sibling nodes with no whitespace between them.
+function getLinkedInElementText(el) {
+    if (!el) return "";
+    const raw = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return raw.replace(/\s+/g, " ").trim();
+}
+
+function trimLinkedInFieldLabelFromElement(el) {
+    return trimLinkedInFieldLabel(getLinkedInElementText(el));
+}
+
 function isVisibleElement(el) {
     if (!el) return false;
     if (el.closest('[aria-hidden="true"]')) return false;
@@ -354,7 +366,7 @@ function getLinkedInFormFieldLabel(element, scope) {
     const elId = element.id;
     if (elId) {
         const label = searchRoot.querySelector('label[for="' + CSS.escape(elId) + '"]');
-        const fromLabel = trimLinkedInFieldLabel(label?.textContent);
+        const fromLabel = trimLinkedInFieldLabelFromElement(label);
         if (fromLabel) return fromLabel;
     }
 
@@ -370,7 +382,7 @@ function getLinkedInFormFieldLabel(element, scope) {
 function getLabelFromFormElementBlock(block, control) {
     if (control?.id) {
         const scopedLabel = block.querySelector('label[for="' + CSS.escape(control.id) + '"]');
-        const scopedText = trimLinkedInFieldLabel(scopedLabel?.textContent);
+        const scopedText = trimLinkedInFieldLabelFromElement(scopedLabel);
         if (scopedText) return scopedText;
     }
 
@@ -382,7 +394,7 @@ function getLabelFromFormElementBlock(block, control) {
         "label",
     ]) {
         const label = block.querySelector(selector);
-        const text = trimLinkedInFieldLabel(label?.textContent);
+        const text = trimLinkedInFieldLabelFromElement(label);
         if (text) return text;
     }
 
@@ -397,7 +409,7 @@ function getLinkedInRadioFieldsetLabel(fieldset) {
     ];
     for (const selector of selectors) {
         const el = fieldset.querySelector(selector);
-        const text = el?.textContent?.trim();
+        const text = trimLinkedInFieldLabelFromElement(el);
         if (text) return text;
     }
     return "";
@@ -411,7 +423,7 @@ function getLinkedInRadioFieldsetAnswer(fieldset) {
     if (rid) {
         const lab = fieldset.querySelector('label[for="' + CSS.escape(rid) + '"]') ||
             document.querySelector('label[for="' + CSS.escape(rid) + '"]');
-        const labelText = lab?.textContent?.trim();
+        const labelText = getLinkedInElementText(lab);
         if (labelText) return labelText;
     }
 
@@ -421,7 +433,7 @@ function getLinkedInRadioFieldsetAnswer(fieldset) {
         if (lab) {
             const attr = lab.getAttribute("data-test-text-selectable-option__label");
             if (attr?.trim()) return attr.trim();
-            const text = lab.textContent?.trim();
+            const text = getLinkedInElementText(lab);
             if (text) return text;
         }
     }
@@ -432,7 +444,7 @@ function getLinkedInRadioFieldsetAnswer(fieldset) {
 function getLinkedInSelectAnswer(select) {
     const opt = select.options[select.selectedIndex];
     if (!opt) return "";
-    const text = opt.textContent?.trim() || "";
+    const text = getLinkedInElementText(opt);
     if (text && !/^(select an option|select)$/i.test(text)) return text;
     return (opt.value || "").trim();
 }
@@ -446,7 +458,7 @@ function getLinkedInRadioGroupAnswer(modal, name) {
     const rid = selected.id;
     if (rid) {
         const lab = modal.querySelector('label[for="' + CSS.escape(rid) + '"]');
-        const labelText = lab?.textContent?.trim();
+        const labelText = getLinkedInElementText(lab);
         if (labelText) return labelText;
     }
 
@@ -468,7 +480,7 @@ function getLinkedInRadioGroupLabel(modal, firstRadio) {
         ".jobs-easy-apply-form-element, [class*='fb-dash']"
     );
     if (wrap) {
-        const text = wrap.textContent?.trim();
+        const text = getLinkedInElementText(wrap);
         if (text) return text;
     }
 
@@ -1294,8 +1306,8 @@ function buildButtons(slot) {
 
     menuWrap.appendChild(savedJobsBtn);
     menuWrap.appendChild(menu);
-    slot.appendChild(saveBtn);
     slot.appendChild(saveQuestionsBtn);
+    slot.appendChild(saveBtn);
     slot.appendChild(questionsWrap);
     slot.appendChild(menuWrap);
     slot.appendChild(downloadBtn);
