@@ -107,6 +107,18 @@ function sharedRefreshPageFlags() {
     sharedLinkedInJobSearchPage = !!document.querySelector('[componentkey="JobsSearchFilters"]');
 }
 
+// Google Sheets maps clicks to cells using its own layout math. Body padding and
+// shifting fixed/sticky nodes moves the grid visually but not hit-testing, so
+// clicks land ~one taskbar height low (often two rows down).
+function sharedIsGoogleSheetsPage() {
+    return location.hostname === "docs.google.com" &&
+        location.pathname.includes("/spreadsheets/");
+}
+
+function sharedShouldSkipPageShifting() {
+    return sharedIsGoogleSheetsPage();
+}
+
 function sharedIsLinkedInJobSearchPage() {
     if (sharedLinkedInJobSearchPage === null) sharedRefreshPageFlags();
     return sharedLinkedInJobSearchPage;
@@ -551,6 +563,12 @@ function sharedProcessMutationBatch(mutations) {
 
 function sharedStartShifting() {
     sharedRefreshPageFlags();
+
+    if (sharedShouldSkipPageShifting()) {
+        // Keep the fixed taskbar overlay only; do not pad or shift the page.
+        return;
+    }
+
     sharedShiftWithin(document.body);
     sharedShiftPrimaryHeaders();
     sharedScheduleViewportConstrain();

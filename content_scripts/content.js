@@ -639,6 +639,18 @@ let savedMenuHoverCloseTimer = null;
 let questionsMenuHoverCloseTimer = null;
 let saveButtonRefreshTimer = null;
 
+function isLinkedInApplicationFormOpen() {
+    return !!(getLinkedInApplicationRoot() || findLinkedInEasyApplyMarker());
+}
+
+function getJobContextForQuestions() {
+    return getJobForSave() || {
+        title: getLinkedInJobTitle() || "",
+        company: getLinkedInJobCompany() || "",
+        url: getLinkedInJobUrl() || "",
+    };
+}
+
 function updateSaveButtonState(saveBtn) {
     const job = getJobForSave();
     if (job) {
@@ -650,6 +662,16 @@ function updateSaveButtonState(saveBtn) {
     }
 }
 
+function updateSaveQuestionsButtonState(saveQuestionsBtn) {
+    if (isLinkedInApplicationFormOpen()) {
+        saveQuestionsBtn.disabled = false;
+        saveQuestionsBtn.textContent = "Save questions";
+    } else {
+        saveQuestionsBtn.disabled = true;
+        saveQuestionsBtn.textContent = "No form open";
+    }
+}
+
 function stopSaveButtonRefresh() {
     if (saveButtonRefreshTimer) {
         clearInterval(saveButtonRefreshTimer);
@@ -657,10 +679,14 @@ function stopSaveButtonRefresh() {
     }
 }
 
-function startSaveButtonRefresh(saveBtn) {
+function startSaveButtonsRefresh(saveBtn, saveQuestionsBtn) {
     stopSaveButtonRefresh();
-    updateSaveButtonState(saveBtn);
-    saveButtonRefreshTimer = setInterval(() => updateSaveButtonState(saveBtn), SAVE_BUTTON_REFRESH_MS);
+    const refresh = () => {
+        updateSaveButtonState(saveBtn);
+        updateSaveQuestionsButtonState(saveQuestionsBtn);
+    };
+    refresh();
+    saveButtonRefreshTimer = setInterval(refresh, SAVE_BUTTON_REFRESH_MS);
 }
 
 function isInsideSavedMenu(target, menuRoot, menu) {
@@ -1147,15 +1173,22 @@ function buildButtons(slot) {
 
         await addSavedJob(job);
         updateSavedJobsCountBtn(savedJobsBtn, menuWrap);
-
-        const applicationRoot = getLinkedInApplicationRoot();
-        if (applicationRoot || findLinkedInEasyApplyMarker()) {
-            const pairs = scanLinkedInApplicationFields(applicationRoot || document);
-            await addSavedApplicationQuestions(pairs, job);
-            updateSavedQuestionsCountBtn(questionsBtn, questionsWrap);
-        }
     });
-    startSaveButtonRefresh(saveBtn);
+
+    const saveQuestionsBtn = document.createElement("button");
+    saveQuestionsBtn.type = "button";
+    saveQuestionsBtn.addEventListener("click", async () => {
+        const applicationRoot = getLinkedInApplicationRoot();
+        if (!applicationRoot && !findLinkedInEasyApplyMarker()) return;
+
+        const pairs = scanLinkedInApplicationFields(applicationRoot || document);
+        if (!pairs.length) return;
+
+        await addSavedApplicationQuestions(pairs, getJobContextForQuestions());
+        updateSavedQuestionsCountBtn(questionsBtn, questionsWrap);
+    });
+
+    startSaveButtonsRefresh(saveBtn, saveQuestionsBtn);
 
     const questionsWrap = document.createElement("div");
     questionsWrap.className = "jobhelp-questions-wrap";
@@ -1262,6 +1295,7 @@ function buildButtons(slot) {
     menuWrap.appendChild(savedJobsBtn);
     menuWrap.appendChild(menu);
     slot.appendChild(saveBtn);
+    slot.appendChild(saveQuestionsBtn);
     slot.appendChild(questionsWrap);
     slot.appendChild(menuWrap);
     slot.appendChild(downloadBtn);
