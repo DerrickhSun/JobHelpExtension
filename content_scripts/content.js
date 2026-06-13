@@ -1271,7 +1271,7 @@ function openSavedJobsMenu(menuRoot) {
 }
 
 // Populates our slot with this extension's buttons. Called by the shared module
-// with our slot element (which lives inside the shared taskbar's shadow DOM).
+// with our slot element (inside the shared taskbar's open shadow root).
 function buildButtons(slot) {
     injectSlotStyles(slot);
     closeSavedJobsMenu(slot);
@@ -1419,31 +1419,62 @@ function buildButtons(slot) {
 // is per-extension storage; the other sharing extension persists its slot
 // independently and the shared module re-merges them (in `order`) on each page.
 const ACTIVE_KEY = "taskbarActive";
+let taskbarRetryTimers = [];
+
+function clearTaskbarRetryTimers() {
+    taskbarRetryTimers.forEach(clearTimeout);
+    taskbarRetryTimers = [];
+}
+
+function scheduleTaskbarRetries() {
+    clearTaskbarRetryTimers();
+    const retry = () => {
+        browser.storage.local.get(ACTIVE_KEY).then((stored) => {
+            if (!stored[ACTIVE_KEY]) return;
+            sharedRebuildSlotIfEmpty(EXT_KEY, buildButtons, TASKBAR_ORDER);
+        });
+    };
+    [100, 200, 400, 800, 1500, 2500].forEach((ms) => {
+        taskbarRetryTimers.push(setTimeout(retry, ms));
+    });
+}
 
 function showTaskbar() {
-  registerTaskbar(EXT_KEY, buildButtons, TASKBAR_ORDER);
+    sharedResetAndOpenTaskbar(EXT_KEY, buildButtons, TASKBAR_ORDER);
+    scheduleTaskbarRetries();
 }
 
 function hideTaskbar() {
-  stopSaveButtonRefresh();
-  unregisterTaskbar(EXT_KEY);
+    stopSaveButtonRefresh();
+    clearTaskbarRetryTimers();
+    sharedFullyCloseTaskbar(EXT_KEY);
 }
 
 browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type === 'TOGGLE_TASKBAR') {
-    const registered = isTaskbarRegistered(EXT_KEY);
-    if (registered) {
+  if (msg.type !== "TOGGLE_TASKBAR") return;
+
+  // taskbarActive in storage is the source of truth — not host presence or buttons.
+  // An empty shell has no buttons but should still close when the user toggles off.
+  browser.storage.local.get(ACTIVE_KEY).then((stored) => {
+    if (stored[ACTIVE_KEY]) {
+      browser.storage.local.set({ [ACTIVE_KEY]: false });
       hideTaskbar();
+      sendResponse({ visible: false });
     } else {
+      browser.storage.local.set({ [ACTIVE_KEY]: true });
       showTaskbar();
+      sendResponse({ visible: true });
     }
-    browser.storage.local.set({ [ACTIVE_KEY]: !registered });
-    sendResponse({ visible: !registered });
-  }
-  return true; // keep channel open for async sendResponse
+  });
+
+  return true;
 });
 
 // On every page load, restore our slot if it was active when we last toggled.
 browser.storage.local.get(ACTIVE_KEY).then((stored) => {
-  if (stored[ACTIVE_KEY]) showTaskbar();
+  if (stored[ACTIVE_KEY]) {
+    showTaskbar();
+  } else if (document.getElementById(SHARED_TASKBAR.HOST_ID) && sharedHostIsEmptyShell()) {
+    sharedRemoveTaskbarHost();
+  }
 });
