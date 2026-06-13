@@ -87,20 +87,84 @@ function looksLikeJobMetadata(text) {
     return /applicants|Promoted|Company review|hours ago|days ago|weeks ago|months ago|·/.test(text);
 }
 
+function looksLikeLinkedInChromeText(text) {
+    return /sign in|join now|join linkedin|take the next step|forgot password|agree\s*&\s*join|ai-powered|tailor my resume|am i a good fit|set alert|get notified|explore top content|evaluate your skills/i.test(text);
+}
+
+function looksLikeValidJobTitle(text) {
+    if (!text || text.length > 200) return false;
+    if (looksLikeJobMetadata(text)) return false;
+    if (looksLikeLinkedInChromeText(text)) return false;
+    return true;
+}
+
+function textFromFirstValidMatch(root, selectors) {
+    for (const selector of selectors) {
+        const el = root.querySelector(selector);
+        const text = el?.textContent?.trim();
+        if (looksLikeValidJobTitle(text)) return text;
+    }
+    return "";
+}
+
+function isLinkedInJobViewPage() {
+    return /\/jobs\/view\/\d+/i.test(location.pathname);
+}
+
+// Standalone /jobs/view/ pages expose stable title/company in <title> and og:title
+// even when the detail pane uses different markup than two-pane search.
+function parseLinkedInJobFromPageTitle(pageTitle) {
+    const title = (pageTitle || "").trim();
+    if (!title) return null;
+
+    const hiring = title.match(/^(.+?) hiring (.+?) in .+? \| LinkedIn$/i);
+    if (hiring) {
+        return { company: hiring[1].trim(), jobTitle: hiring[2].trim() };
+    }
+
+    const simple = title.match(/^(.+?) \| LinkedIn$/i);
+    if (simple) {
+        return { company: "", jobTitle: simple[1].trim() };
+    }
+
+    return null;
+}
+
+function parseLinkedInJobFromDocumentTitle() {
+    const fromDocument = parseLinkedInJobFromPageTitle(document.title);
+    if (fromDocument) return fromDocument;
+
+    const ogTitle = document.querySelector('meta[property="og:title"]')?.content;
+    return parseLinkedInJobFromPageTitle(ogTitle);
+}
+
+function textFromLinkedInDisplayBlock(block) {
+    const selectors = [":scope > p", ":scope > h1", ":scope > h2", "h1", "h2"];
+    for (const selector of selectors) {
+        const el = block.querySelector(selector);
+        if (!el || el.querySelector('a[href*="/company/"]')) continue;
+
+        const text = el.textContent.trim();
+        if (!looksLikeValidJobTitle(text)) continue;
+        return text;
+    }
+
+    return null;
+}
+
 // LinkedIn's newer UI uses obfuscated classes; stable hooks are aria-label and
-// data-display-contents. Title sits in the first simple <p> block after company.
+// data-display-contents. Title sits in the first simple block after company.
 function getLinkedInJobTitleFromModernUI() {
     const blocks = [...document.querySelectorAll('[data-display-contents="true"]')];
     const companyIdx = blocks.findIndex((b) => b.querySelector('[aria-label*="Company,"]'));
     if (companyIdx < 0) return null;
 
     for (let i = companyIdx + 1; i < blocks.length; i++) {
-        const p = blocks[i].querySelector(":scope > p");
-        if (!p || p.querySelector('a[href*="/company/"]')) continue;
+        const block = blocks[i];
+        if (block.querySelector('[aria-label*="Company,"]')) continue;
 
-        const text = p.textContent.trim();
-        if (!text || looksLikeJobMetadata(text) || text.length > 200) continue;
-        return text;
+        const text = textFromLinkedInDisplayBlock(block);
+        if (text) return text;
     }
 
     return null;
@@ -122,6 +186,11 @@ function getLinkedInCompanyFromModernUI() {
 // Selectors aligned with job_searcher.py (SEL + parse_current_job_from_detail_pane).
 function getLinkedInJobCompany() {
     if (!isLinkedInJobDisplayed()) return null;
+
+    if (isLinkedInJobViewPage()) {
+        const fromPageTitle = parseLinkedInJobFromDocumentTitle();
+        if (fromPageTitle?.company) return fromPageTitle.company;
+    }
 
     const modernCompany = getLinkedInCompanyFromModernUI();
     if (modernCompany) return modernCompany;
@@ -149,6 +218,12 @@ function getLinkedInJobCompany() {
         if (rowCompany) return rowCompany;
     }
 
+    if (isLinkedInJobViewPage()) {
+        const companyLink = document.querySelector("main a[href*='/company/']");
+        const linkText = companyLink?.textContent?.trim();
+        if (linkText) return linkText;
+    }
+
     return null;
 }
 
@@ -156,15 +231,28 @@ function getLinkedInJobCompany() {
 function getLinkedInJobTitle() {
     if (!isLinkedInJobDisplayed()) return null;
 
+    if (isLinkedInJobViewPage()) {
+        const fromPageTitle = parseLinkedInJobFromDocumentTitle();
+        if (fromPageTitle?.jobTitle) return fromPageTitle.jobTitle;
+    }
+
     const modernTitle = getLinkedInJobTitleFromModernUI();
     if (modernTitle) return modernTitle;
 
-    const detailTitle = textFromFirstMatch(document, [
+    const detailTitle = textFromFirstValidMatch(document, [
         ".jobs-unified-top-card__job-title",
         ".jobs-details-top-card__title-text",
         "h1.jobs-unified-top-card__job-title",
         "div[class*='jobs-details-top-card'] h1",
         "h1[class*='job-title']",
+        "main h1",
+        "h1.top-card-layout__title",
+        "h1.topcard__title",
+        ".top-card-layout__title",
+        "main h2",
+        "main [role='heading'][aria-level='1']",
+        "div[class*='jobs-details'] h1",
+        "div[class*='jobs-details'] h2",
     ]);
     if (detailTitle) return detailTitle;
 
@@ -174,7 +262,7 @@ function getLinkedInJobTitle() {
         'li[aria-current="true"]'
     );
     if (activeRow) {
-        const rowTitle = textFromFirstMatch(activeRow, [
+        const rowTitle = textFromFirstValidMatch(activeRow, [
             '[class*="job-card-job-posting-card-wrapper__title"]',
             "strong",
         ]);
@@ -182,11 +270,11 @@ function getLinkedInJobTitle() {
 
         const link = activeRow.querySelector('a[href*="/jobs/view/"], a[href*="currentJobId"]');
         const ariaLabel = link?.getAttribute("aria-label")?.trim();
-        if (ariaLabel) return ariaLabel;
+        if (looksLikeValidJobTitle(ariaLabel)) return ariaLabel;
     }
 
-    const h1 = document.querySelector("h1")?.textContent?.trim();
-    if (h1) return h1;
+    const h1 = document.querySelector("main h1, h1")?.textContent?.trim();
+    if (looksLikeValidJobTitle(h1)) return h1;
 
     return null;
 }
