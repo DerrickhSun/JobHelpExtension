@@ -1420,17 +1420,29 @@ function buildButtons(slot) {
 // independently and the shared module re-merges them (in `order`) on each page.
 const ACTIVE_KEY = "taskbarActive";
 let taskbarRetryTimers = [];
+let jobhelpTaskbarActive = false;
 
 function clearTaskbarRetryTimers() {
     taskbarRetryTimers.forEach(clearTimeout);
     taskbarRetryTimers = [];
 }
 
+function jobhelpHasOtherExtensionSlots() {
+    const host = document.getElementById(SHARED_TASKBAR.HOST_ID);
+    const root = host && host.shadowRoot;
+    if (!root) return false;
+    const slots = root.querySelector("." + SHARED_TASKBAR.SLOTS_CLASS);
+    if (!slots) return false;
+    return Array.from(slots.children).some(
+        (slot) => slot.getAttribute("data-ext") !== EXT_KEY
+    );
+}
+
 function scheduleTaskbarRetries() {
     clearTaskbarRetryTimers();
     const retry = () => {
         browser.storage.local.get(ACTIVE_KEY).then((stored) => {
-            if (!stored[ACTIVE_KEY]) return;
+            if (!stored[ACTIVE_KEY] || !jobhelpTaskbarActive) return;
             sharedRebuildSlotIfEmpty(EXT_KEY, buildButtons, TASKBAR_ORDER);
         });
     };
@@ -1440,14 +1452,42 @@ function scheduleTaskbarRetries() {
 }
 
 function showTaskbar() {
-    sharedResetAndOpenTaskbar(EXT_KEY, buildButtons, TASKBAR_ORDER);
+    jobhelpTaskbarActive = true;
+
+    const openNow = () => {
+        if (!jobhelpTaskbarActive) return;
+
+        const host = document.getElementById(SHARED_TASKBAR.HOST_ID);
+        // Cold reset only when alone and the shell is empty (LinkedIn job search fix).
+        if (host && !jobhelpHasOtherExtensionSlots() && sharedHostIsEmptyShell()) {
+            sharedRemoveTaskbarHost();
+        }
+
+        registerTaskbar(EXT_KEY, buildButtons, TASKBAR_ORDER);
+        sharedRescanAfterOpen();
+    };
+
+    // Join an already-open shared bar immediately; defer solo opens for SPA timing.
+    if (document.getElementById(SHARED_TASKBAR.HOST_ID) && jobhelpHasOtherExtensionSlots()) {
+        openNow();
+    } else {
+        queueMicrotask(() => {
+            requestAnimationFrame(() => {
+                requestAnimationFrame(openNow);
+            });
+        });
+    }
+
     scheduleTaskbarRetries();
 }
 
 function hideTaskbar() {
+    jobhelpTaskbarActive = false;
     stopSaveButtonRefresh();
     clearTaskbarRetryTimers();
-    sharedFullyCloseTaskbar(EXT_KEY);
+    sharedStopSlotIntegrityObserver();
+    // Cooperative close: remove only our slot; host stays for other extensions.
+    unregisterTaskbar(EXT_KEY);
 }
 
 browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -1474,7 +1514,11 @@ browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 browser.storage.local.get(ACTIVE_KEY).then((stored) => {
   if (stored[ACTIVE_KEY]) {
     showTaskbar();
-  } else if (document.getElementById(SHARED_TASKBAR.HOST_ID) && sharedHostIsEmptyShell()) {
+  } else if (
+    document.getElementById(SHARED_TASKBAR.HOST_ID) &&
+    sharedHostIsEmptyShell() &&
+    !jobhelpHasOtherExtensionSlots()
+  ) {
     sharedRemoveTaskbarHost();
   }
 });
