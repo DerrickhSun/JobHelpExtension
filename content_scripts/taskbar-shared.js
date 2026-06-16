@@ -243,6 +243,32 @@ function sharedIsLikelyPrimaryNav(el, cs) {
     return rect.top >= 0 && rect.top <= SHARED_TASKBAR.HEIGHT && rect.width > window.innerWidth * 0.4;
 }
 
+function sharedOverflowCreatesScrollport(cs) {
+    return cs.overflow === "auto" || cs.overflow === "scroll" || cs.overflow === "overlay" ||
+        cs.overflowY === "auto" || cs.overflowY === "scroll" || cs.overflowY === "overlay";
+}
+
+// Nearest ancestor whose overflow establishes the stick container for position:sticky.
+function sharedFindStickyScrollport(el) {
+    let node = el.parentElement;
+    while (node) {
+        if (!(node instanceof HTMLElement)) break;
+        if (sharedOverflowCreatesScrollport(getComputedStyle(node))) return node;
+        node = node.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
+}
+
+// Sticky in a nested scrollport (e.g. SPA main panel) is offset by body padding alone.
+// Sticky on the document scrollport (e.g. forum nav) needs top so its stick point clears
+// our bar — padding does not change where sticky;top:0 pins when the page scrolls.
+function sharedStickyUsesDocumentScroll(el) {
+    const scrollport = sharedFindStickyScrollport(el);
+    return scrollport === document.body ||
+        scrollport === document.documentElement ||
+        (document.scrollingElement && scrollport === document.scrollingElement);
+}
+
 // Full-width bar pinned to the top band of the viewport (not a anchored popup).
 function sharedIsTopViewportChrome(el, cs) {
     cs = cs || getComputedStyle(el);
@@ -588,10 +614,11 @@ function sharedShouldSkipShift(el, cs) {
     if (sharedIsAppPositionedOverlay(el, cs)) return true;
     if (sharedFindAnchoredShiftedReference(el)) return true;
 
-    // In-flow sticky chrome is already offset by body padding; shifting top again
-    // double-counts (e.g. ChatGPT thread header). Only stacked sub-rows with an
-    // explicit top/inset below the main band still need their own bump.
-    if (cs.position === "sticky" && !sharedIsStackedSubHeaderRow(el, cs)) return true;
+    // Nested scrollport: body padding is enough. Document scrollport: set top so the
+    // stick point clears our bar when the page scrolls (forum navs, etc.).
+    if (cs.position === "sticky" && !sharedIsStackedSubHeaderRow(el, cs)) {
+        if (!sharedStickyUsesDocumentScroll(el)) return true;
+    }
 
     if (sharedHasFixedContainingBlockAncestor(el)) return true;
 
