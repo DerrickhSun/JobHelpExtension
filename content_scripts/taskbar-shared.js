@@ -27,6 +27,21 @@ const SHARED_TASKBAR = {
     PREV_MIN_HEIGHT_ATTR: "data-shared-taskbar-prev-min-height",
     PREV_HEIGHT_ATTR: "data-shared-taskbar-prev-height",
     PREV_OVERFLOW_Y_ATTR: "data-shared-taskbar-prev-overflow-y",
+    // Body's own padding-top before we touched it (exact inline value, for restore)
+    // and the computed baseline captured at the same time (for target math — the
+    // page may have reserved space for its own fixed header via body padding, and
+    // our shifted-down copy of that header needs padding = base + HEIGHT, not just
+    // HEIGHT, to avoid overlapping the content below it).
+    PREV_BODY_PADDING_ATTR: "data-shared-taskbar-prev-body-padding",
+    BODY_PADDING_BASE_ATTR: "data-shared-taskbar-body-padding-base",
+    // Some elements are actively driven by the page itself (e.g. scroll-reveal
+    // chrome that toggles its own top/transform to hide at the top of the page) —
+    // forcing our shift onto them fights that toggle forever. FIGHT_COUNT/TS track
+    // how often we've had to re-correct a given element in a short window;
+    // QUARANTINED_ATTR marks one we've given up on so we stop touching it.
+    FIGHT_COUNT_ATTR: "data-shared-taskbar-fight-count",
+    FIGHT_TS_ATTR: "data-shared-taskbar-fight-ts",
+    QUARANTINED_ATTR: "data-shared-taskbar-quarantined",
     EVT_READY: "shared-taskbar:ready",
     EVT_REMOVED: "shared-taskbar:removed",
     EVT_PAGE_NAV: "shared-taskbar:page-nav",
@@ -40,8 +55,8 @@ const SHARED_TASKBAR = {
 let sharedTaskbarObserver = null;
 let sharedMutationTimer = null;
 let sharedPendingMutations = null;
-let sharedLinkedInJobSearchPage = null;
-let sharedOrgStickyObserver = null;
+// let sharedLinkedInJobSearchPage = null; // disabled — LinkedIn-specific, see below
+// let sharedOrgStickyObserver = null; // disabled — LinkedIn-specific, see below
 let sharedConstrainTimer = null;
 let sharedResizeConstrainHandler = null;
 let sharedSpaNavInstalled = false;
@@ -51,11 +66,13 @@ let sharedRegisteringSlot = false;
 let sharedTaskbarOpenAllowed = false;
 let sharedOpenEpoch = 0;
 const sharedShiftedElements = new Set();
-const sharedOrgStickyWatched = new WeakSet();
+// const sharedOrgStickyWatched = new WeakSet(); // disabled — LinkedIn-specific, see below
 const SHARED_MUTATION_DEBOUNCE_MS = 250;
 const SHARED_CONSTRAIN_DEBOUNCE_MS = 150;
 const SHARED_HEADER_MAX_DEPTH = 10;
 const SHARED_MIN_CONSTRAIN_HEIGHT = 100;
+const SHARED_FIGHT_LIMIT = 3;
+const SHARED_FIGHT_WINDOW_MS = 3000;
 
 // A transform/filter/etc. on an ancestor makes position:fixed relative to that
 // ancestor instead of the viewport, so shifting the ancestor is enough.
@@ -138,13 +155,14 @@ function sharedFindPositionedAncestorOrSelf(el) {
     return null;
 }
 
-function sharedIsOrgStickyCard(el) {
-    return !!el.closest(".org-sticky-top-card, .org-sticky-top-card__container");
-}
+// Disabled — LinkedIn-specific, being phased out in favor of general handling.
+// function sharedIsOrgStickyCard(el) {
+//     return !!el.closest(".org-sticky-top-card, .org-sticky-top-card__container");
+// }
 
-function sharedRefreshPageFlags() {
-    sharedLinkedInJobSearchPage = !!document.querySelector('[componentkey="JobsSearchFilters"]');
-}
+// function sharedRefreshPageFlags() {
+//     sharedLinkedInJobSearchPage = !!document.querySelector('[componentkey="JobsSearchFilters"]');
+// }
 
 // Google Sheets maps clicks to cells using its own layout math. Body padding and
 // shifting fixed/sticky nodes moves the grid visually but not hit-testing, so
@@ -158,68 +176,69 @@ function sharedShouldSkipPageShifting() {
     return sharedIsGoogleSheetsPage();
 }
 
-function sharedIsLinkedInJobSearchPage() {
-    if (sharedLinkedInJobSearchPage === null) sharedRefreshPageFlags();
-    return sharedLinkedInJobSearchPage;
-}
+// Disabled — LinkedIn-specific, being phased out in favor of general handling.
+// function sharedIsLinkedInJobSearchPage() {
+//     if (sharedLinkedInJobSearchPage === null) sharedRefreshPageFlags();
+//     return sharedLinkedInJobSearchPage;
+// }
 
-function sharedIsJobSearchFilter(el) {
-    if (sharedIsOrgStickyCard(el)) return false;
-    if (!sharedIsLinkedInJobSearchPage()) return false;
-    if (el.closest('[componentkey="JobsSearchFilters"], [class*="jobs-search"], [class*="search-results"]')) {
-        return true;
-    }
-    // Job-search filter toolbar is sticky/fixed itself; JobsSearchFilters is nested
-    // inside it, so closest() on the toolbar element never sees that marker.
-    if (el.getAttribute("role") === "toolbar" && el.querySelector('[componentkey="JobsSearchFilters"]')) {
-        return true;
-    }
-    return false;
-}
+// function sharedIsJobSearchFilter(el) {
+//     if (sharedIsOrgStickyCard(el)) return false;
+//     if (!sharedIsLinkedInJobSearchPage()) return false;
+//     if (el.closest('[componentkey="JobsSearchFilters"], [class*="jobs-search"], [class*="search-results"]')) {
+//         return true;
+//     }
+//     // Job-search filter toolbar is sticky/fixed itself; JobsSearchFilters is nested
+//     // inside it, so closest() on the toolbar element never sees that marker.
+//     if (el.getAttribute("role") === "toolbar" && el.querySelector('[componentkey="JobsSearchFilters"]')) {
+//         return true;
+//     }
+//     return false;
+// }
 
-function sharedIsLinkedInProfilePage() {
-    return /linkedin\.com/i.test(location.hostname) &&
-        /^\/in\/[^/?#]+/i.test(location.pathname);
-}
+// function sharedIsLinkedInProfilePage() {
+//     return /linkedin\.com/i.test(location.hostname) &&
+//         /^\/in\/[^/?#]+/i.test(location.pathname);
+// }
 
 // Profile sub-toolbar (name / Resources / Enhance profile) is scroll-reveal chrome.
 // LinkedIn hides it at scroll top via its own top/transform; forcing top: 50px
 // fights that toggle and flickers at the page top.
-function sharedIsLinkedInProfileScrollToolbar(el) {
-    if (!sharedIsLinkedInProfilePage()) return false;
-    const bar = el.getAttribute("role") === "toolbar" ? el : el.closest('[role="toolbar"]');
-    if (!(bar instanceof HTMLElement)) return false;
-    return !sharedIsNavChrome(bar);
-}
+// function sharedIsLinkedInProfileScrollToolbar(el) {
+//     if (!sharedIsLinkedInProfilePage()) return false;
+//     const bar = el.getAttribute("role") === "toolbar" ? el : el.closest('[role="toolbar"]');
+//     if (!(bar instanceof HTMLElement)) return false;
+//     return !sharedIsNavChrome(bar);
+// }
 
 // Secondary sticky rows on job search (filter toolbar, "Jobs based on your
 // preferences", results chrome) track the shifted main nav — only top ~0 needs
 // an independent bump. Must not call sharedGetEffectiveTop (that calls
 // sharedIsLikelyPrimaryNav, which calls back here).
-function sharedIsJobSearchSecondaryHeader(el, cs) {
-    if (!sharedIsLinkedInJobSearchPage()) return false;
-    cs = cs || getComputedStyle(el);
-    if (cs.position !== "fixed" && cs.position !== "sticky") return false;
-
-    const rect = el.getBoundingClientRect();
-    if (rect.height > 0) {
-        if (rect.top >= SHARED_TASKBAR.HEIGHT - 4) return true;
-        return false;
-    }
-
-    let top = parseFloat(cs.top);
-    if (!isNaN(top) && cs.top !== "auto") {
-        return top >= SHARED_TASKBAR.HEIGHT - 4;
-    }
-
-    const inset = parseFloat(cs.getPropertyValue("inset-block-start"));
-    if (!isNaN(inset) && cs.getPropertyValue("inset-block-start") !== "auto") {
-        return inset >= SHARED_TASKBAR.HEIGHT - 4;
-    }
-
-    // Unknown top — treat as secondary (prior sharedGetEffectiveTop null path).
-    return true;
-}
+// function sharedIsJobSearchSecondaryHeader(el, cs) {
+//     if (!sharedIsLinkedInJobSearchPage()) return false;
+//     cs = cs || getComputedStyle(el);
+//     if (cs.position !== "fixed" && cs.position !== "sticky") return false;
+//
+//     const rect = el.getBoundingClientRect();
+//     if (rect.height > 0) {
+//         if (rect.top >= SHARED_TASKBAR.HEIGHT - 4) return true;
+//         return false;
+//     }
+//
+//     let top = parseFloat(cs.top);
+//     if (!isNaN(top) && cs.top !== "auto") {
+//         return top >= SHARED_TASKBAR.HEIGHT - 4;
+//     }
+//
+//     const inset = parseFloat(cs.getPropertyValue("inset-block-start"));
+//     if (!isNaN(inset) && cs.getPropertyValue("inset-block-start") !== "auto") {
+//         return inset >= SHARED_TASKBAR.HEIGHT - 4;
+//     }
+//
+//     // Unknown top — treat as secondary (prior sharedGetEffectiveTop null path).
+//     return true;
+// }
 
 function sharedIsStuckInHeaderZone(el) {
     const rect = el.getBoundingClientRect();
@@ -250,13 +269,14 @@ function sharedGetEffectiveTop(el, cs) {
     const inset = parseFloat(cs.getPropertyValue("inset-block-start"));
     if (!isNaN(inset) && cs.getPropertyValue("inset-block-start") !== "auto") return inset;
 
-    if (sharedIsOrgStickyCard(el) && sharedIsStuckInHeaderZone(el)) {
-        const rectTop = Math.round(el.getBoundingClientRect().top);
-        if (el.hasAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR)) {
-            return sharedGetShiftBaseTop(el) + SHARED_TASKBAR.HEIGHT;
-        }
-        return rectTop;
-    }
+    // Disabled — LinkedIn-specific (org-sticky-card) branch, see sharedIsOrgStickyCard.
+    // if (sharedIsOrgStickyCard(el) && sharedIsStuckInHeaderZone(el)) {
+    //     const rectTop = Math.round(el.getBoundingClientRect().top);
+    //     if (el.hasAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR)) {
+    //         return sharedGetShiftBaseTop(el) + SHARED_TASKBAR.HEIGHT;
+    //     }
+    //     return rectTop;
+    // }
 
     if (sharedIsLikelyPrimaryNav(el, cs)) {
         const rectTop = Math.round(el.getBoundingClientRect().top);
@@ -292,12 +312,14 @@ function sharedGetEffectiveTop(el, cs) {
 function sharedIsLikelyPrimaryNav(el, cs) {
     cs = cs || getComputedStyle(el);
     if (cs.position !== "fixed" && cs.position !== "sticky") return false;
-    if (sharedIsOrgStickyCard(el)) return false;
-    if (sharedIsJobSearchFilter(el)) return false;
-    if (sharedIsLinkedInProfileScrollToolbar(el)) return false;
-    if (sharedIsJobSearchSecondaryHeader(el, cs)) return false;
-    if (el.closest("header, [role=\"banner\"], #global-nav, .global-nav")) return true;
-    if (el.closest("shreddit-header, reddit-header")) return true;
+    // LinkedIn-specific guards disabled — see sharedIsOrgStickyCard,
+    // sharedIsJobSearchFilter, sharedIsLinkedInProfileScrollToolbar,
+    // sharedIsJobSearchSecondaryHeader above.
+    // if (sharedIsOrgStickyCard(el)) return false;
+    // if (sharedIsJobSearchFilter(el)) return false;
+    // if (sharedIsLinkedInProfileScrollToolbar(el)) return false;
+    // if (sharedIsJobSearchSecondaryHeader(el, cs)) return false;
+    if (el.closest("header, [role=\"banner\"]")) return true; // #global-nav, .global-nav (LinkedIn) removed
     const rect = el.getBoundingClientRect();
     return rect.top >= 0 && rect.top <= SHARED_TASKBAR.HEIGHT && rect.width > window.innerWidth * 0.4;
 }
@@ -350,13 +372,33 @@ function sharedIsViewportHeaderCandidate(el, cs, rect) {
 // Popups/menus positioned below the taskbar zone (often via anchor getBoundingClientRect
 // after body padding or a shifted header) — shifting again double-offsets them.
 function sharedIsAppPositionedOverlay(el, cs) {
+    // Once we've shifted this element ourselves, its live top IS base+HEIGHT, which
+    // would otherwise look identical to a page-native overlay already sitting below
+    // the bar — judge it by the pre-shift base instead, or we'd mistake our own
+    // shift for something to leave alone, restore it, see the un-shifted top on the
+    // next pass, shift it again, and ping-pong forever.
+    if (el.hasAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR)) {
+        return sharedGetShiftBaseTop(el) >= SHARED_TASKBAR.HEIGHT - 4;
+    }
+
+    // Not yet tracked: if it's already RENDERING at/below the bar band, some other
+    // arrangement — body padding, a row stacked after an already-shifted sibling,
+    // a sticky element whose un-stuck flow position was already pushed down — has
+    // already cleared it. This checks the actual rendered rect, not the declared
+    // CSS top (a sticky element can declare top:0 and still render lower once
+    // ambient page shifting has moved it). A genuinely still-pinned top:0 bar is
+    // still rendering at 0 here, so it falls through to the header-candidate
+    // checks below untouched.
+    const rect = el.getBoundingClientRect();
+    if (rect.height > 0 && rect.top >= SHARED_TASKBAR.HEIGHT - 4) return true;
+
     if (sharedIsViewportHeaderCandidate(el, cs)) return false;
     if (sharedIsTopViewportChrome(el, cs)) return false;
 
     const top = sharedGetEffectiveTop(el, cs);
     if (top !== null) return top >= SHARED_TASKBAR.HEIGHT - 4;
 
-    return el.getBoundingClientRect().top >= SHARED_TASKBAR.HEIGHT - 4;
+    return rect.top >= SHARED_TASKBAR.HEIGHT - 4;
 }
 
 function sharedRectsLookAnchoredToReference(popupRect, refRect) {
@@ -389,44 +431,32 @@ function sharedFindAnchoredShiftedReference(el) {
     return null;
 }
 
-function sharedFindLinkedInGlobalNav() {
-    if (!/linkedin\.com/i.test(location.hostname)) return null;
-    const selectors = [
-        "#global-nav",
-        "header.global-nav",
-        "header[role=\"banner\"]",
-        ".global-nav__nav",
-        "nav[aria-label=\"Primary\"]",
-    ];
-    for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el instanceof HTMLElement) {
-            return sharedFindPositionedAncestorOrSelf(el) || el;
-        }
-    }
-    return null;
-}
-
-function sharedFindRedditHeader() {
-    if (!/reddit\.com/i.test(location.hostname)) return null;
-    const selectors = [
-        "shreddit-header",
-        "reddit-header",
-        "[data-testid=\"reddit-header\"]",
-    ];
-    for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el instanceof HTMLElement) {
-            return sharedFindPositionedAncestorOrSelf(el) || el;
-        }
-    }
-    return null;
-}
+// Disabled — LinkedIn-specific, being phased out in favor of general handling.
+// function sharedFindLinkedInGlobalNav() {
+//     if (!/linkedin\.com/i.test(location.hostname)) return null;
+//     const selectors = [
+//         "#global-nav",
+//         "header.global-nav",
+//         "header[role=\"banner\"]",
+//         ".global-nav__nav",
+//         "nav[aria-label=\"Primary\"]",
+//     ];
+//     for (const sel of selectors) {
+//         const el = document.querySelector(sel);
+//         if (el instanceof HTMLElement) {
+//             return sharedFindPositionedAncestorOrSelf(el) || el;
+//         }
+//     }
+//     return null;
+// }
 
 // Cheap upkeep for the main nav and already-tracked headers — not a full-page rescan.
 function sharedShiftPrimaryHeaders() {
-    const nav = sharedFindLinkedInGlobalNav() || sharedFindRedditHeader();
-    if (nav) sharedShiftFixedElement(nav);
+    // Site-specific nav lookup disabled — see sharedFindLinkedInGlobalNav below.
+    // General shift tracking below (sharedShiftedElements loop) covers headers
+    // discovered via the full-tree walk / mutation scan instead.
+    // const nav = sharedFindLinkedInGlobalNav();
+    // if (nav) sharedShiftFixedElement(nav);
     const googleSearch = document.getElementById("searchform");
     if (googleSearch) sharedShiftFixedElement(googleSearch);
     for (const el of sharedShiftedElements) {
@@ -435,7 +465,7 @@ function sharedShiftPrimaryHeaders() {
 }
 
 function sharedIsNavChrome(el) {
-    return !!el.closest("header, [role=\"banner\"], #global-nav, .global-nav");
+    return !!el.closest("header, [role=\"banner\"]"); // #global-nav, .global-nav (LinkedIn) removed
 }
 
 function sharedFindOutermostOverflowingAncestor(el, viewportH) {
@@ -703,26 +733,28 @@ function sharedCollectViewportConstraintCandidates() {
     return candidates;
 }
 
+// Disabled — LinkedIn-specific, being phased out in favor of general handling.
 // LinkedIn job-search panels use 100vh and may need inner scroll once shifted.
-function sharedConstrainLinkedInViewportOverflow(viewportH) {
-    const roots = new Set();
-    for (const el of sharedCollectViewportConstraintCandidates()) {
-        if (!(el instanceof HTMLElement) || sharedIsNavChrome(el)) continue;
-        const rect = el.getBoundingClientRect();
-        if (rect.bottom <= viewportH + 2 || rect.height < SHARED_MIN_CONSTRAIN_HEIGHT) continue;
-        roots.add(sharedFindOutermostOverflowingAncestor(el, viewportH));
-    }
-    for (const el of roots) sharedConstrainElementToViewport(el, viewportH);
-}
+// function sharedConstrainLinkedInViewportOverflow(viewportH) {
+//     const roots = new Set();
+//     for (const el of sharedCollectViewportConstraintCandidates()) {
+//         if (!(el instanceof HTMLElement) || sharedIsNavChrome(el)) continue;
+//         const rect = el.getBoundingClientRect();
+//         if (rect.bottom <= viewportH + 2 || rect.height < SHARED_MIN_CONSTRAIN_HEIGHT) continue;
+//         roots.add(sharedFindOutermostOverflowingAncestor(el, viewportH));
+//     }
+//     for (const el of roots) sharedConstrainElementToViewport(el, viewportH);
+// }
 
 function sharedConstrainViewportOverflow() {
     if (!document.getElementById(SHARED_TASKBAR.HOST_ID)) return;
     if (sharedShouldSkipPageShifting()) return;
 
     const viewportH = window.innerHeight;
-    if (sharedIsLinkedInJobSearchPage()) {
-        sharedConstrainLinkedInViewportOverflow(viewportH);
-    }
+    // LinkedIn-specific constrain pass disabled — see sharedConstrainLinkedInViewportOverflow.
+    // if (sharedIsLinkedInJobSearchPage()) {
+    //     sharedConstrainLinkedInViewportOverflow(viewportH);
+    // }
     sharedTrimViewportFitShells(viewportH);
 }
 
@@ -740,48 +772,50 @@ function sharedApplyTop(el, topPx) {
     el.style.setProperty("top", topPx + "px", "important");
 }
 
-function sharedFindPositionedForRoot(root) {
-    if (!(root instanceof HTMLElement)) return null;
-    const pcs = getComputedStyle(root);
-    if (pcs.position === "fixed" || pcs.position === "sticky") return root;
-    for (const child of root.children) {
-        if (!(child instanceof HTMLElement)) continue;
-        const ccs = getComputedStyle(child);
-        if (ccs.position === "fixed" || ccs.position === "sticky") return child;
-    }
-    return sharedFindPositionedAncestorOrSelf(root);
-}
+// Disabled block — LinkedIn-specific (org-sticky-card) IntersectionObserver
+// subsystem, being phased out in favor of general handling.
+// function sharedFindPositionedForRoot(root) {
+//     if (!(root instanceof HTMLElement)) return null;
+//     const pcs = getComputedStyle(root);
+//     if (pcs.position === "fixed" || pcs.position === "sticky") return root;
+//     for (const child of root.children) {
+//         if (!(child instanceof HTMLElement)) continue;
+//         const ccs = getComputedStyle(child);
+//         if (ccs.position === "fixed" || ccs.position === "sticky") return child;
+//     }
+//     return sharedFindPositionedAncestorOrSelf(root);
+// }
 
-function sharedEnsureOrgStickyObserver() {
-    if (sharedOrgStickyObserver) return;
-    sharedOrgStickyObserver = new IntersectionObserver((entries) => {
-        for (const entry of entries) {
-            const positioned = sharedFindPositionedForRoot(entry.target);
-            if (positioned) sharedShiftFixedElement(positioned);
-        }
-    }, {
-        rootMargin: (-SHARED_TASKBAR.HEIGHT) + "px 0px 0px 0px",
-        threshold: [0, 0.01, 1],
-    });
-}
+// function sharedEnsureOrgStickyObserver() {
+//     if (sharedOrgStickyObserver) return;
+//     sharedOrgStickyObserver = new IntersectionObserver((entries) => {
+//         for (const entry of entries) {
+//             const positioned = sharedFindPositionedForRoot(entry.target);
+//             if (positioned) sharedShiftFixedElement(positioned);
+//         }
+//     }, {
+//         rootMargin: (-SHARED_TASKBAR.HEIGHT) + "px 0px 0px 0px",
+//         threshold: [0, 0.01, 1],
+//     });
+// }
 
-function sharedWatchOrgStickyRoot(root) {
-    if (!(root instanceof HTMLElement) || sharedOrgStickyWatched.has(root)) return;
-    sharedEnsureOrgStickyObserver();
-    sharedOrgStickyWatched.add(root);
-    sharedOrgStickyObserver.observe(root);
-    const positioned = sharedFindPositionedForRoot(root);
-    if (positioned) sharedShiftFixedElement(positioned);
-}
+// function sharedWatchOrgStickyRoot(root) {
+//     if (!(root instanceof HTMLElement) || sharedOrgStickyWatched.has(root)) return;
+//     sharedEnsureOrgStickyObserver();
+//     sharedOrgStickyWatched.add(root);
+//     sharedOrgStickyObserver.observe(root);
+//     const positioned = sharedFindPositionedForRoot(root);
+//     if (positioned) sharedShiftFixedElement(positioned);
+// }
 
-function sharedDiscoverOrgStickyCards(root) {
-    if (!(root instanceof HTMLElement)) return;
-    if (root.matches(".org-sticky-top-card, .org-sticky-top-card__container")) {
-        sharedWatchOrgStickyRoot(root);
-    }
-    if (!root.querySelectorAll) return;
-    root.querySelectorAll(".org-sticky-top-card, .org-sticky-top-card__container").forEach(sharedWatchOrgStickyRoot);
-}
+// function sharedDiscoverOrgStickyCards(root) {
+//     if (!(root instanceof HTMLElement)) return;
+//     if (root.matches(".org-sticky-top-card, .org-sticky-top-card__container")) {
+//         sharedWatchOrgStickyRoot(root);
+//     }
+//     if (!root.querySelectorAll) return;
+//     root.querySelectorAll(".org-sticky-top-card, .org-sticky-top-card__container").forEach(sharedWatchOrgStickyRoot);
+// }
 
 function sharedGetShiftBaseTop(el) {
     const base = parseFloat(el.getAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR));
@@ -808,7 +842,8 @@ function sharedRecordShiftRowHeight(el) {
 // Stacked sub-headers (e.g. LinkedIn company bar) pin below the main row with an
 // explicit top/inset and need their own bump even inside an already-shifted ancestor.
 function sharedIsStackedSubHeaderRow(el, cs) {
-    if (sharedIsOrgStickyCard(el)) return true;
+    // LinkedIn-specific guard disabled — see sharedIsOrgStickyCard.
+    // if (sharedIsOrgStickyCard(el)) return true;
 
     cs = cs || getComputedStyle(el);
     let top = parseFloat(cs.top);
@@ -822,16 +857,36 @@ function sharedIsStackedSubHeaderRow(el, cs) {
     return false;
 }
 
+// True once we've had to re-correct this element's top SHARED_FIGHT_LIMIT times
+// within SHARED_FIGHT_WINDOW_MS — a sign something else (a scroll-reveal toggle,
+// an animation) is actively driving the same property and will never settle.
+function sharedRecordShiftFight(el) {
+    const now = Date.now();
+    const lastTs = parseFloat(el.getAttribute(SHARED_TASKBAR.FIGHT_TS_ATTR));
+    let count = parseFloat(el.getAttribute(SHARED_TASKBAR.FIGHT_COUNT_ATTR)) || 0;
+    if (isNaN(lastTs) || now - lastTs > SHARED_FIGHT_WINDOW_MS) {
+        count = 0;
+    }
+    count += 1;
+    el.setAttribute(SHARED_TASKBAR.FIGHT_COUNT_ATTR, String(count));
+    el.setAttribute(SHARED_TASKBAR.FIGHT_TS_ATTR, String(now));
+    return count >= SHARED_FIGHT_LIMIT;
+}
+
 // Skip when a shifted fixed/sticky ancestor already moves this element. The only
 // descendant exception is a stacked sub-row with explicit top/inset ≥ nav height.
 function sharedShouldSkipShift(el, cs) {
     cs = cs || getComputedStyle(el);
     if (cs.position !== "fixed" && cs.position !== "sticky") return true;
+    if (el.hasAttribute(SHARED_TASKBAR.QUARANTINED_ATTR)) return true;
 
-    if (sharedIsOrgStickyCard(el)) return false;
-    if (sharedIsJobSearchFilter(el)) return true;
-    if (sharedIsLinkedInProfileScrollToolbar(el)) return true;
-    if (sharedIsJobSearchSecondaryHeader(el, cs)) return true;
+    // LinkedIn-specific guards disabled — see sharedIsOrgStickyCard,
+    // sharedIsJobSearchFilter, sharedIsLinkedInProfileScrollToolbar,
+    // sharedIsJobSearchSecondaryHeader above.
+    // if (sharedIsOrgStickyCard(el)) return false;
+    // if (sharedIsJobSearchFilter(el)) return true;
+    // if (sharedIsLinkedInProfileScrollToolbar(el)) return true;
+    // if (sharedIsJobSearchSecondaryHeader(el, cs)) return true;
     if (sharedIsAppPositionedOverlay(el, cs)) return true;
     if (sharedFindAnchoredShiftedReference(el)) return true;
 
@@ -882,10 +937,11 @@ function sharedShiftFixedElement(el, cs) {
             return;
         }
 
-        if (sharedIsOrgStickyCard(el) && !sharedIsStuckInHeaderZone(el)) {
-            if (el.hasAttribute(SHARED_TASKBAR.SHIFTED_ATTR)) sharedRestoreShiftedElement(el);
-            return;
-        }
+        // LinkedIn-specific guard disabled — see sharedIsOrgStickyCard.
+        // if (sharedIsOrgStickyCard(el) && !sharedIsStuckInHeaderZone(el)) {
+        //     if (el.hasAttribute(SHARED_TASKBAR.SHIFTED_ATTR)) sharedRestoreShiftedElement(el);
+        //     return;
+        // }
     }
 
     if (el.hasAttribute(SHARED_TASKBAR.SHIFTED_ATTR)) {
@@ -903,6 +959,15 @@ function sharedShiftFixedElement(el, cs) {
         const target = base + SHARED_TASKBAR.HEIGHT;
         const current = sharedGetEffectiveTop(el, cs);
         if (current === null || Math.abs(current - target) > 0.5) {
+            // Something other than us changed this element's top since we last set
+            // it (e.g. a scroll-reveal toggle). Re-applying wins the immediate
+            // fight but not the next one — if it keeps happening, give up instead
+            // of flickering forever.
+            if (sharedRecordShiftFight(el)) {
+                el.setAttribute(SHARED_TASKBAR.QUARANTINED_ATTR, "1");
+                sharedRestoreShiftedElement(el);
+                return;
+            }
             sharedApplyTop(el, target);
         }
         if (sharedGetShiftBaseTop(el) < SHARED_TASKBAR.HEIGHT) {
@@ -958,19 +1023,21 @@ function sharedShiftElementTree(root) {
 
 function sharedShiftWithin(root) {
     sharedShiftElementTree(root);
-    if (document.getElementById(SHARED_TASKBAR.HOST_ID)) sharedDiscoverOrgStickyCards(root);
+    // LinkedIn-specific org-sticky-card discovery disabled — see sharedDiscoverOrgStickyCards.
+    // if (document.getElementById(SHARED_TASKBAR.HOST_ID)) sharedDiscoverOrgStickyCards(root);
 }
 
 // Cheap filter — no getBoundingClientRect (avoids layout thrash on feed mutations).
 function sharedIsHeaderMutationCandidate(el) {
     if (el.id === SHARED_TASKBAR.HOST_ID) return false;
     if (el.id === "searchform") return true;
-    if (sharedIsLinkedInProfileScrollToolbar(el)) return false;
+    // LinkedIn-specific guard disabled — see sharedIsLinkedInProfileScrollToolbar.
+    // if (sharedIsLinkedInProfileScrollToolbar(el)) return false;
     if (el.hasAttribute(SHARED_TASKBAR.SHIFTED_ATTR)) return true;
-    if (el.closest(".org-sticky-top-card, .org-sticky-top-card__container, header, [role=\"banner\"], [role=\"toolbar\"]")) {
+    if (el.closest("header, [role=\"banner\"], [role=\"toolbar\"]")) { // .org-sticky-top-card (LinkedIn) removed
         return true;
     }
-    if (el.hasAttribute("componentkey")) return true;
+    // if (el.hasAttribute("componentkey")) return true; // LinkedIn-specific attribute, disabled
     const style = el.getAttribute("style");
     if (style && /position\s*:\s*(fixed|sticky)/i.test(style)) return true;
     let depth = 0;
@@ -994,8 +1061,13 @@ function sharedProcessMutationBatch(mutations) {
         } else {
             for (const node of m.addedNodes) {
                 if (!(node instanceof HTMLElement)) continue;
-                sharedDiscoverOrgStickyCards(node);
-                if (sharedIsHeaderMutationCandidate(node)) sharedShiftFixedElement(node);
+                // LinkedIn-specific org-sticky-card discovery disabled — see sharedDiscoverOrgStickyCards.
+                // sharedDiscoverOrgStickyCards(node);
+                // Walk the whole added subtree (not just this node) — a fixed/sticky
+                // header several levels down inside a freshly-mounted subtree arrives
+                // as a descendant of a single addedNodes entry, never as its own
+                // mutation record, so a node-only check would miss it entirely.
+                sharedShiftElementTree(node);
             }
         }
     }
@@ -1004,14 +1076,45 @@ function sharedProcessMutationBatch(mutations) {
     sharedEnsureBodyPadding();
 }
 
+// Capture the page's own padding-top exactly once, before we ever modify it —
+// both the raw inline value (for exact restore) and the computed baseline (for
+// target math). Idempotent: a no-op once the base attribute is present, so it's
+// safe to call from either extension on every ensure/register.
+function sharedCaptureBodyPadding() {
+    if (document.body.hasAttribute(SHARED_TASKBAR.BODY_PADDING_BASE_ATTR)) return;
+    document.body.setAttribute(
+        SHARED_TASKBAR.PREV_BODY_PADDING_ATTR,
+        document.body.style.getPropertyValue("padding-top") || ""
+    );
+    const base = parseFloat(getComputedStyle(document.body).paddingTop);
+    document.body.setAttribute(
+        SHARED_TASKBAR.BODY_PADDING_BASE_ATTR,
+        String(isNaN(base) ? 0 : base)
+    );
+}
+
+function sharedGetBodyPaddingBase() {
+    const base = parseFloat(document.body.getAttribute(SHARED_TASKBAR.BODY_PADDING_BASE_ATTR));
+    return isNaN(base) ? 0 : base;
+}
+
+function sharedRestoreBodyPadding() {
+    const prev = document.body.getAttribute(SHARED_TASKBAR.PREV_BODY_PADDING_ATTR);
+    document.body.style.removeProperty("padding-top");
+    if (prev) document.body.style.setProperty("padding-top", prev);
+    document.body.removeAttribute(SHARED_TASKBAR.PREV_BODY_PADDING_ATTR);
+    document.body.removeAttribute(SHARED_TASKBAR.BODY_PADDING_BASE_ATTR);
+}
+
 function sharedEnsureBodyPadding() {
     if (!document.getElementById(SHARED_TASKBAR.HOST_ID)) return;
     if (sharedShouldSkipPageShifting()) return;
 
+    const target = sharedGetBodyPaddingBase() + SHARED_TASKBAR.HEIGHT;
     const pad = parseFloat(getComputedStyle(document.body).paddingTop);
-    if (isNaN(pad) || pad < SHARED_TASKBAR.HEIGHT - 1) {
+    if (isNaN(pad) || pad < target - 1) {
         document.body.style.setProperty(
-            "padding-top", SHARED_TASKBAR.HEIGHT + "px", "important"
+            "padding-top", target + "px", "important"
         );
     }
 }
@@ -1023,7 +1126,8 @@ function sharedPruneDisconnectedShiftedElements() {
 }
 
 function sharedApplyPageShift() {
-    sharedRefreshPageFlags();
+    // LinkedIn-specific flag refresh disabled — see sharedRefreshPageFlags.
+    // sharedRefreshPageFlags();
 
     if (sharedShouldSkipPageShifting()) return;
 
@@ -1033,14 +1137,14 @@ function sharedApplyPageShift() {
     sharedScheduleViewportConstrain();
     if (document.getElementById(SHARED_TASKBAR.HOST_ID)) {
         document.body.style.setProperty(
-            "padding-top", SHARED_TASKBAR.HEIGHT + "px", "important"
+            "padding-top", (sharedGetBodyPaddingBase() + SHARED_TASKBAR.HEIGHT) + "px", "important"
         );
     }
 }
 
 function sharedRescanAfterOpen() {
     if (!document.getElementById(SHARED_TASKBAR.HOST_ID)) return;
-    sharedLinkedInJobSearchPage = null;
+    // sharedLinkedInJobSearchPage = null; // LinkedIn-specific, disabled
     sharedApplyPageShift();
     sharedEnsureBodyPadding();
 }
@@ -1065,7 +1169,7 @@ function sharedStartShifting() {
             const batch = sharedPendingMutations;
             sharedPendingMutations = null;
             if (!batch || !batch.length) return;
-            sharedRefreshPageFlags();
+            // sharedRefreshPageFlags(); // LinkedIn-specific, disabled
             sharedProcessMutationBatch(batch);
         }, SHARED_MUTATION_DEBOUNCE_MS);
     });
@@ -1096,24 +1200,30 @@ function sharedStopShifting() {
         sharedResizeConstrainHandler = null;
     }
     sharedPendingMutations = null;
-    sharedLinkedInJobSearchPage = null;
+    // sharedLinkedInJobSearchPage = null; // LinkedIn-specific, disabled
     sharedShiftedElements.clear();
-    if (sharedOrgStickyObserver) {
-        sharedOrgStickyObserver.disconnect();
-        sharedOrgStickyObserver = null;
-    }
+    // LinkedIn-specific org-sticky observer teardown disabled — see sharedOrgStickyObserver.
+    // if (sharedOrgStickyObserver) {
+    //     sharedOrgStickyObserver.disconnect();
+    //     sharedOrgStickyObserver = null;
+    // }
     if (sharedTaskbarObserver) {
         sharedTaskbarObserver.disconnect();
         sharedTaskbarObserver = null;
     }
     sharedStopSlotIntegrityObserver();
-    document.body.style.removeProperty("padding-top");
+    sharedRestoreBodyPadding();
     document.querySelectorAll("[" + SHARED_TASKBAR.SHIFTED_ATTR + "]").forEach(sharedRestoreShiftedElement);
     document.querySelectorAll("[" + SHARED_TASKBAR.SHIFT_ROW_HEIGHT_ATTR + "]").forEach((el) => {
         el.removeAttribute(SHARED_TASKBAR.SHIFT_ROW_HEIGHT_ATTR);
     });
     document.querySelectorAll("[" + SHARED_TASKBAR.CONSTRAINED_ATTR + "]").forEach(sharedRestoreViewportConstraint);
     document.querySelectorAll("[" + SHARED_TASKBAR.FIT_TRIM_ATTR + "]").forEach(sharedRestoreViewportFitTrim);
+    document.querySelectorAll("[" + SHARED_TASKBAR.QUARANTINED_ATTR + "]").forEach((el) => {
+        el.removeAttribute(SHARED_TASKBAR.QUARANTINED_ATTR);
+        el.removeAttribute(SHARED_TASKBAR.FIGHT_COUNT_ATTR);
+        el.removeAttribute(SHARED_TASKBAR.FIGHT_TS_ATTR);
+    });
 }
 
 // ---- host lifecycle --------------------------------------------------------
@@ -1304,7 +1414,7 @@ function sharedInstallSpaNavigationWatch() {
     const onNavigate = () => {
         if (location.href === lastHref) return;
         lastHref = location.href;
-        sharedLinkedInJobSearchPage = null;
+        // sharedLinkedInJobSearchPage = null; // LinkedIn-specific, disabled
         if (!document.getElementById(SHARED_TASKBAR.HOST_ID)) return;
         sharedStartShifting();
         document.dispatchEvent(new CustomEvent(SHARED_TASKBAR.EVT_PAGE_NAV, {
@@ -1328,6 +1438,7 @@ function sharedInstallSpaNavigationWatch() {
 // duplicate bars).
 function sharedEnsureTaskbar() {
     sharedInstallSpaNavigationWatch();
+    sharedCaptureBodyPadding();
 
     let existing = document.getElementById(SHARED_TASKBAR.HOST_ID);
     if (existing) {
@@ -1450,14 +1561,15 @@ function registerTaskbar(extKey, buildFn, order) {
             }
         }
 
-        if (sharedIsLinkedInJobSearchPage()) {
-            setTimeout(() => {
-                if (!sharedTaskbarOpenAllowed) return;
-                sharedApplyPageShift();
-            }, 120);
-        } else {
-            sharedApplyPageShift();
-        }
+        // LinkedIn-specific delayed re-shift disabled — see sharedIsLinkedInJobSearchPage.
+        // if (sharedIsLinkedInJobSearchPage()) {
+        //     setTimeout(() => {
+        //         if (!sharedTaskbarOpenAllowed) return;
+        //         sharedApplyPageShift();
+        //     }, 120);
+        // } else {
+        sharedApplyPageShift();
+        // }
         sharedWatchSlotIntegrity(extKey, buildFn, order);
         return slot;
     } finally {
