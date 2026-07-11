@@ -47,6 +47,68 @@ const SHARED_TASKBAR = {
     EVT_PAGE_NAV: "shared-taskbar:page-nav",
 };
 
+// ---- zoom compensation ------------------------------------------------------
+// Browser page zoom (ctrl+/ctrl-) scales every CSS px uniformly, so anything we
+// size in px would otherwise grow or shrink on screen right along with the
+// page. We want the taskbar to stay a constant physical size instead, so we
+// track window.devicePixelRatio — which browsers scale by the current zoom
+// factor — relative to whatever it was when this script first ran, and shrink
+// or grow our own CSS px by the inverse so the on-screen result cancels the
+// page's zoom back out. (This also reacts to a real DPI change, e.g. dragging
+// the window to a different-scaling monitor — there's no way to tell that
+// apart from a zoom change from content-script-accessible APIs alone, so a
+// mid-session monitor move will be misread as a zoom change.)
+const sharedZoomBaselineDpr = window.devicePixelRatio || 1;
+let sharedZoomMedia = null;
+
+function sharedZoomRatio() {
+    return (window.devicePixelRatio || 1) / sharedZoomBaselineDpr;
+}
+
+// Scale a design-time px value by the inverse of the current zoom ratio.
+function sharedZoomPx(px) {
+    return px / sharedZoomRatio();
+}
+
+function sharedBarHeight() {
+    return sharedZoomPx(SHARED_TASKBAR.HEIGHT);
+}
+
+function sharedRefreshHostChrome() {
+    const host = document.getElementById(SHARED_TASKBAR.HOST_ID);
+    if (!host) return;
+    sharedApplyHostChromeStyles(host);
+    const style = sharedQueryTaskbar(host, "style[data-shared-taskbar]");
+    if (style) style.textContent = sharedHostStyleSheet();
+}
+
+function sharedOnZoomChange() {
+    sharedRefreshHostChrome();
+    sharedApplyPageShift();
+}
+
+// There is no native "zoom changed" event. matchMedia on the current
+// devicePixelRatio fires its change event the instant that ratio moves away
+// from the value it was created with, which we use as a proxy zoom signal —
+// then immediately re-create the query against the new ratio so it can fire
+// again on the next change.
+function sharedWatchZoom() {
+    if (sharedZoomMedia) return;
+
+    const onZoomMediaChange = () => {
+        trackZoomMedia();
+        sharedOnZoomChange();
+    };
+
+    function trackZoomMedia() {
+        if (sharedZoomMedia) sharedZoomMedia.removeEventListener("change", onZoomMediaChange);
+        sharedZoomMedia = window.matchMedia("(resolution: " + window.devicePixelRatio + "dppx)");
+        sharedZoomMedia.addEventListener("change", onZoomMediaChange);
+    }
+
+    trackZoomMedia();
+}
+
 // ---- page shifting ---------------------------------------------------------
 // All shift state is stored in the DOM (an attribute on each moved element and
 // body's inline paddingTop) so that *either* extension can undo it, even the one
@@ -131,7 +193,7 @@ function sharedIsAbsoluteTopHeader(el, cs) {
     if (cs.position !== "absolute") return false;
     if (el.id === "searchform") return true;
     const rect = el.getBoundingClientRect();
-    if (rect.height <= 0 || rect.top > SHARED_TASKBAR.HEIGHT + 8) return false;
+    if (rect.height <= 0 || rect.top > sharedBarHeight() + 8) return false;
     const top = parseFloat(cs.top);
     if (isNaN(top) || cs.top === "auto" || top >= SHARED_TASKBAR.MAX_SHIFT_TOP) return false;
     return rect.width > window.innerWidth * 0.35;
@@ -243,8 +305,8 @@ function sharedShouldSkipPageShifting() {
 function sharedIsStuckInHeaderZone(el) {
     const rect = el.getBoundingClientRect();
     if (rect.height <= 0) return false;
-    const min = SHARED_TASKBAR.HEIGHT - 4;
-    const max = SHARED_TASKBAR.MAX_SHIFT_TOP + SHARED_TASKBAR.HEIGHT;
+    const min = sharedBarHeight() - 4;
+    const max = SHARED_TASKBAR.MAX_SHIFT_TOP + sharedBarHeight();
     return rect.top >= min && rect.top <= max;
 }
 
@@ -252,11 +314,11 @@ function sharedIsStuckInHeaderZone(el) {
 // rect.top ≈ HEIGHT but the CSS top base is still 0 — do not treat rect as base.
 function sharedRectTopToShiftBase(el, cs, rectTop) {
     cs = cs || getComputedStyle(el);
-    if (cs.position === "sticky" && rectTop >= SHARED_TASKBAR.HEIGHT - 4 &&
-        rectTop <= SHARED_TASKBAR.HEIGHT + 12) {
+    if (cs.position === "sticky" && rectTop >= sharedBarHeight() - 4 &&
+        rectTop <= sharedBarHeight() + 12) {
         return 0;
     }
-    if (rectTop <= SHARED_TASKBAR.HEIGHT + 8) return rectTop;
+    if (rectTop <= sharedBarHeight() + 8) return rectTop;
     if (cs.position === "sticky") return 0;
     return rectTop;
 }
@@ -281,7 +343,7 @@ function sharedGetEffectiveTop(el, cs) {
     if (sharedIsLikelyPrimaryNav(el, cs)) {
         const rectTop = Math.round(el.getBoundingClientRect().top);
         if (el.hasAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR)) {
-            return sharedGetShiftBaseTop(el) + SHARED_TASKBAR.HEIGHT;
+            return sharedGetShiftBaseTop(el) + sharedBarHeight();
         }
         const base = sharedRectTopToShiftBase(el, cs, rectTop);
         return base < SHARED_TASKBAR.MAX_SHIFT_TOP ? base : 0;
@@ -290,7 +352,7 @@ function sharedGetEffectiveTop(el, cs) {
     if (sharedIsTopViewportChrome(el, cs)) {
         const rectTop = Math.round(el.getBoundingClientRect().top);
         if (el.hasAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR)) {
-            return sharedGetShiftBaseTop(el) + SHARED_TASKBAR.HEIGHT;
+            return sharedGetShiftBaseTop(el) + sharedBarHeight();
         }
         const base = sharedRectTopToShiftBase(el, cs, rectTop);
         return base <= SHARED_TASKBAR.MAX_SHIFT_TOP ? base : 0;
@@ -299,7 +361,7 @@ function sharedGetEffectiveTop(el, cs) {
     if (sharedIsAbsoluteTopHeader(el, cs)) {
         const rectTop = Math.round(el.getBoundingClientRect().top);
         if (el.hasAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR)) {
-            return sharedGetShiftBaseTop(el) + SHARED_TASKBAR.HEIGHT;
+            return sharedGetShiftBaseTop(el) + sharedBarHeight();
         }
         let top = parseFloat(cs.top);
         if (!isNaN(top) && cs.top !== "auto") return top;
@@ -321,7 +383,7 @@ function sharedIsLikelyPrimaryNav(el, cs) {
     // if (sharedIsJobSearchSecondaryHeader(el, cs)) return false;
     if (el.closest("header, [role=\"banner\"]")) return true; // #global-nav, .global-nav (LinkedIn) removed
     const rect = el.getBoundingClientRect();
-    return rect.top >= 0 && rect.top <= SHARED_TASKBAR.HEIGHT && rect.width > window.innerWidth * 0.4;
+    return rect.top >= 0 && rect.top <= sharedBarHeight() && rect.width > window.innerWidth * 0.4;
 }
 
 function sharedOverflowCreatesScrollport(cs) {
@@ -356,7 +418,7 @@ function sharedIsTopViewportChrome(el, cs) {
     if (cs.position !== "fixed" && cs.position !== "sticky") return false;
     const rect = el.getBoundingClientRect();
     if (rect.height <= 0 || rect.width < window.innerWidth * 0.4) return false;
-    return rect.top >= 0 && rect.top <= SHARED_TASKBAR.HEIGHT + 8;
+    return rect.top >= 0 && rect.top <= sharedBarHeight() + 8;
 }
 
 // Full-width top chrome we still shift (nav, stacked sub-headers). Narrow overlays
@@ -378,7 +440,7 @@ function sharedIsAppPositionedOverlay(el, cs) {
     // shift for something to leave alone, restore it, see the un-shifted top on the
     // next pass, shift it again, and ping-pong forever.
     if (el.hasAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR)) {
-        return sharedGetShiftBaseTop(el) >= SHARED_TASKBAR.HEIGHT - 4;
+        return sharedGetShiftBaseTop(el) >= sharedBarHeight() - 4;
     }
 
     // Not yet tracked: if it's already RENDERING at/below the bar band, some other
@@ -390,15 +452,15 @@ function sharedIsAppPositionedOverlay(el, cs) {
     // still rendering at 0 here, so it falls through to the header-candidate
     // checks below untouched.
     const rect = el.getBoundingClientRect();
-    if (rect.height > 0 && rect.top >= SHARED_TASKBAR.HEIGHT - 4) return true;
+    if (rect.height > 0 && rect.top >= sharedBarHeight() - 4) return true;
 
     if (sharedIsViewportHeaderCandidate(el, cs)) return false;
     if (sharedIsTopViewportChrome(el, cs)) return false;
 
     const top = sharedGetEffectiveTop(el, cs);
-    if (top !== null) return top >= SHARED_TASKBAR.HEIGHT - 4;
+    if (top !== null) return top >= sharedBarHeight() - 4;
 
-    return rect.top >= SHARED_TASKBAR.HEIGHT - 4;
+    return rect.top >= sharedBarHeight() - 4;
 }
 
 function sharedRectsLookAnchoredToReference(popupRect, refRect) {
@@ -608,7 +670,7 @@ function sharedApplyViewportFitTrim(el, maxH, cs) {
 
 function sharedPageIsNaturallyScrollable() {
     const doc = document.scrollingElement || document.documentElement;
-    return doc.scrollHeight > window.innerHeight + SHARED_TASKBAR.HEIGHT + 64;
+    return doc.scrollHeight > window.innerHeight + sharedBarHeight() + 64;
 }
 
 // Tailwind / modern apps often pin the UI with h-svh, h-screen, etc.
@@ -631,18 +693,18 @@ function sharedIsExplicitViewportShell(el) {
 // not a long document that genuinely exceeds the viewport.
 function sharedShouldTrimViewportFit(el, rect, viewportH) {
     if (el === document.body || el === document.documentElement) return false;
-    if (rect.top > SHARED_TASKBAR.HEIGHT + 8) return false;
+    if (rect.top > sharedBarHeight() + 8) return false;
 
     const overflow = rect.bottom - viewportH;
     if (sharedIsExplicitViewportShell(el)) {
         // Once trimmed the shell no longer overflows, but we must stay trimmed.
         if (el.hasAttribute(SHARED_TASKBAR.FIT_TRIM_ATTR)) return true;
-        return overflow > 2 && rect.height >= viewportH - SHARED_TASKBAR.HEIGHT - 32;
+        return overflow > 2 && rect.height >= viewportH - sharedBarHeight() - 32;
     }
 
-    if (overflow <= 2 || overflow > SHARED_TASKBAR.HEIGHT + 12) return false;
+    if (overflow <= 2 || overflow > sharedBarHeight() + 12) return false;
     if (rect.height < viewportH - 32) return false;
-    if (rect.height > viewportH + SHARED_TASKBAR.HEIGHT + 12) return false;
+    if (rect.height > viewportH + sharedBarHeight() + 12) return false;
     return true;
 }
 
@@ -847,11 +909,11 @@ function sharedIsStackedSubHeaderRow(el, cs) {
 
     cs = cs || getComputedStyle(el);
     let top = parseFloat(cs.top);
-    if (!isNaN(top) && cs.top !== "auto" && top >= SHARED_TASKBAR.HEIGHT - 4) return true;
+    if (!isNaN(top) && cs.top !== "auto" && top >= sharedBarHeight() - 4) return true;
 
     const inset = parseFloat(cs.getPropertyValue("inset-block-start"));
     if (!isNaN(inset) && cs.getPropertyValue("inset-block-start") !== "auto" &&
-        inset >= SHARED_TASKBAR.HEIGHT - 4) {
+        inset >= sharedBarHeight() - 4) {
         return true;
     }
     return false;
@@ -948,15 +1010,15 @@ function sharedShiftFixedElement(el, cs) {
         // Always restore to the original base + bar height. Do not add HEIGHT
         // to the current computed top (that double-shifts after Google scroll).
         let base = sharedGetShiftBaseTop(el);
-        if (cs.position === "sticky" && base >= SHARED_TASKBAR.HEIGHT - 4 &&
-            base <= SHARED_TASKBAR.HEIGHT + 12) {
+        if (cs.position === "sticky" && base >= sharedBarHeight() - 4 &&
+            base <= sharedBarHeight() + 12) {
             const prevTop = el.getAttribute(SHARED_TASKBAR.SHIFTED_ATTR) || "";
             if (prevTop === "" || prevTop === "0" || prevTop === "0px") {
                 base = 0;
                 el.setAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR, "0");
             }
         }
-        const target = base + SHARED_TASKBAR.HEIGHT;
+        const target = base + sharedBarHeight();
         const current = sharedGetEffectiveTop(el, cs);
         if (current === null || Math.abs(current - target) > 0.5) {
             // Something other than us changed this element's top since we last set
@@ -970,7 +1032,7 @@ function sharedShiftFixedElement(el, cs) {
             }
             sharedApplyTop(el, target);
         }
-        if (sharedGetShiftBaseTop(el) < SHARED_TASKBAR.HEIGHT) {
+        if (sharedGetShiftBaseTop(el) < sharedBarHeight()) {
             sharedRecordShiftRowHeight(el);
         }
         return;
@@ -979,7 +1041,7 @@ function sharedShiftFixedElement(el, cs) {
     const top = sharedGetEffectiveTop(el, cs);
     if (top === null || top >= SHARED_TASKBAR.MAX_SHIFT_TOP) return;
 
-    const targetTop = top + SHARED_TASKBAR.HEIGHT;
+    const targetTop = top + sharedBarHeight();
     const rectTop = Math.round(el.getBoundingClientRect().top);
     if (Math.abs(rectTop - targetTop) <= 3) {
         // Already at the intended visual offset (e.g. body padding) — track only.
@@ -993,9 +1055,9 @@ function sharedShiftFixedElement(el, cs) {
 
     el.setAttribute(SHARED_TASKBAR.SHIFTED_ATTR, el.style.getPropertyValue("top") || "");
     el.setAttribute(SHARED_TASKBAR.SHIFT_BASE_ATTR, String(top));
-    sharedApplyTop(el, top + SHARED_TASKBAR.HEIGHT);
+    sharedApplyTop(el, top + sharedBarHeight());
     sharedShiftedElements.add(el);
-    if (top < SHARED_TASKBAR.HEIGHT) sharedRecordShiftRowHeight(el);
+    if (top < sharedBarHeight()) sharedRecordShiftRowHeight(el);
 }
 
 function sharedShiftElementTree(root) {
@@ -1110,7 +1172,7 @@ function sharedEnsureBodyPadding() {
     if (!document.getElementById(SHARED_TASKBAR.HOST_ID)) return;
     if (sharedShouldSkipPageShifting()) return;
 
-    const target = sharedGetBodyPaddingBase() + SHARED_TASKBAR.HEIGHT;
+    const target = sharedGetBodyPaddingBase() + sharedBarHeight();
     const pad = parseFloat(getComputedStyle(document.body).paddingTop);
     if (isNaN(pad) || pad < target - 1) {
         document.body.style.setProperty(
@@ -1137,7 +1199,7 @@ function sharedApplyPageShift() {
     sharedScheduleViewportConstrain();
     if (document.getElementById(SHARED_TASKBAR.HOST_ID)) {
         document.body.style.setProperty(
-            "padding-top", (sharedGetBodyPaddingBase() + SHARED_TASKBAR.HEIGHT) + "px", "important"
+            "padding-top", (sharedGetBodyPaddingBase() + sharedBarHeight()) + "px", "important"
         );
     }
 }
@@ -1231,7 +1293,8 @@ function sharedStopShifting() {
 // foreign light-DOM children under <html>; shadow content survives that.
 // Any cooperating extension can still reach slots via host.shadowRoot.
 function sharedApplyHostChromeStyles(host) {
-    const h = SHARED_TASKBAR.HEIGHT + "px";
+    const h = sharedBarHeight() + "px";
+    const borderW = sharedZoomPx(2) + "px";
     host.style.setProperty("position", "fixed", "important");
     host.style.setProperty("top", "0", "important");
     host.style.setProperty("left", "0", "important");
@@ -1239,7 +1302,7 @@ function sharedApplyHostChromeStyles(host) {
     host.style.setProperty("height", h, "important");
     host.style.setProperty("max-height", h, "important");
     host.style.setProperty("box-sizing", "border-box", "important");
-    host.style.setProperty("border-bottom", "2px solid #000", "important");
+    host.style.setProperty("border-bottom", borderW + " solid #000", "important");
     host.style.setProperty("background-color", "#f0f0f0", "important");
     host.style.setProperty("z-index", "2147483647", "important");
     host.style.setProperty("overflow", "hidden", "important");
@@ -1258,24 +1321,30 @@ function sharedQueryTaskbar(host, selector) {
 }
 
 function sharedHostStyleSheet() {
-    const h = SHARED_TASKBAR.HEIGHT + "px";
+    const h = sharedBarHeight() + "px";
+    const gap = sharedZoomPx(8) + "px";
+    const slotGap = sharedZoomPx(6) + "px";
+    const barPad = sharedZoomPx(12) + "px";
+    const btnPadV = sharedZoomPx(6) + "px";
+    const btnPadH = sharedZoomPx(12) + "px";
+    const fontSize = sharedZoomPx(13) + "px";
     return (
         ":host{display:block!important;width:100%!important;height:100%!important;" +
         "max-height:" + h + "!important;box-sizing:border-box!important;" +
         "overflow:hidden!important;visibility:visible!important;opacity:1!important;}" +
-        ".bar{display:flex!important;align-items:center!important;gap:8px!important;" +
-        "height:100%!important;max-height:" + h + "!important;padding:0 12px!important;" +
+        ".bar{display:flex!important;align-items:center!important;gap:" + gap + "!important;" +
+        "height:100%!important;max-height:" + h + "!important;padding:0 " + barPad + "!important;" +
         "box-sizing:border-box!important;font-family:system-ui,sans-serif!important;" +
         "visibility:visible!important;overflow:hidden!important;" +
         "background-color:#f0f0f0!important;}" +
         "." + SHARED_TASKBAR.SLOTS_CLASS +
-        "{display:flex!important;align-items:center!important;gap:8px!important;flex:1 1 auto!important;" +
+        "{display:flex!important;align-items:center!important;gap:" + gap + "!important;flex:1 1 auto!important;" +
         "min-width:0!important;visibility:visible!important;overflow:visible!important;}" +
         "." + SHARED_TASKBAR.SLOT_CLASS +
-        "{display:flex!important;align-items:center!important;gap:6px!important;flex:0 0 auto!important;" +
+        "{display:flex!important;align-items:center!important;gap:" + slotGap + "!important;flex:0 0 auto!important;" +
         "visibility:visible!important;overflow:visible!important;}" +
         "button{display:inline-block!important;visibility:visible!important;" +
-        "opacity:1!important;padding:6px 12px!important;font-size:13px!important;cursor:pointer!important;}"
+        "opacity:1!important;padding:" + btnPadV + " " + btnPadH + "!important;font-size:" + fontSize + "!important;cursor:pointer!important;}"
     );
 }
 
@@ -1439,6 +1508,7 @@ function sharedInstallSpaNavigationWatch() {
 function sharedEnsureTaskbar() {
     sharedInstallSpaNavigationWatch();
     sharedCaptureBodyPadding();
+    sharedWatchZoom();
 
     let existing = document.getElementById(SHARED_TASKBAR.HOST_ID);
     if (existing) {
