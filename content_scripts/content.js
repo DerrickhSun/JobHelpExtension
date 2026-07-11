@@ -10,8 +10,14 @@ const EXT_KEY = "jobhelp";
 // appear SECOND, so this must be greater than the other extension's order.
 const TASKBAR_ORDER = 20;
 
-// saveTextFile, storage (savedJobs/savedApplicationQuestions), and download
-// formatting all live in shared/storage.js, loaded before this file.
+// Uses the downloads API; prior extension exports are removed before each save.
+function saveTextFile(text, filename) {
+    return browser.runtime.sendMessage({
+        type: "DOWNLOAD_TEXT_FILE",
+        text,
+        filename,
+    });
+}
 
 function isLinkedInPage() {
     return location.hostname === "www.linkedin.com" || location.hostname === "linkedin.com";
@@ -291,6 +297,31 @@ function formatSavedJobLabel(job) {
     const company = job.company || "";
     if (company) return company + ", " + title;
     return title;
+}
+
+function formatSavedJobDate(job) {
+    const ts = job.savedAt;
+    if (!ts) return "";
+
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return "";
+
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return year + "-" + month + "-" + day;
+}
+
+function formatSavedJobDownloadLine(job) {
+    const company = job.company || "";
+    const date = formatSavedJobDate(job);
+    const title = job.title || "";
+    const url = job.url || "";
+    return company + ", " + date + ", " + title + ", " + url;
+}
+
+function savedJobKey(job) {
+    return (job.company || "") + "\0" + (job.title || "");
 }
 
 function trimLinkedInFieldLabel(text) {
@@ -710,8 +741,10 @@ function scanLinkedInApplicationFields(root) {
     return pairs;
 }
 
-// `browser` and the SAVED_JOBS_KEY/SAVED_APPLICATION_QUESTIONS_KEY storage
-// layer are defined in shared/storage.js, loaded before this file.
+const browser = globalThis.browser ?? globalThis.chrome;
+
+const SAVED_JOBS_KEY = "savedJobs";
+const SAVED_APPLICATION_QUESTIONS_KEY = "savedApplicationQuestions";
 const SAVED_MENU_HOVER_CLOSE_MS = 350;
 const SAVED_MENU_VIEWPORT_MARGIN = 8;
 const SAVED_QUESTION_PREVIEW_LENGTH = 30;
@@ -912,6 +945,42 @@ function openSavedQuestionsMenu(menuRoot) {
     });
 }
 
+async function getSavedJobs() {
+    const stored = await browser.storage.local.get(SAVED_JOBS_KEY);
+    return stored[SAVED_JOBS_KEY] || [];
+}
+
+async function addSavedJob(job) {
+    const savedJobs = await getSavedJobs();
+    const entry = {
+        title: job.title,
+        company: job.company || "",
+        url: job.url || "",
+        savedAt: Date.now(),
+    };
+    const key = savedJobKey(entry);
+    const withoutDup = savedJobs.filter((saved) => savedJobKey(saved) !== key);
+    withoutDup.unshift(entry);
+    await browser.storage.local.set({ [SAVED_JOBS_KEY]: withoutDup });
+}
+
+async function removeSavedJob(job) {
+    const savedJobs = await getSavedJobs();
+    const key = savedJobKey(job);
+    const filtered = savedJobs.filter((saved) => savedJobKey(saved) !== key);
+    await browser.storage.local.set({ [SAVED_JOBS_KEY]: filtered });
+}
+
+async function clearSavedJobs() {
+    await browser.storage.local.set({ [SAVED_JOBS_KEY]: [] });
+}
+
+function formatSavedJobsCountLabel(count) {
+    if (!count) return "No jobs saved";
+    if (count === 1) return "1 job saved";
+    return count + " jobs saved";
+}
+
 function updateSavedJobsCountBtn(btn, menuRoot) {
     getSavedJobs().then((jobs) => {
         btn.textContent = formatSavedJobsCountLabel(jobs.length);
@@ -931,6 +1000,81 @@ function updateSavedJobsCountBtn(btn, menuRoot) {
             positionSavedJobsMenu(menuRoot, menu);
         }
     });
+}
+
+async function getSavedApplicationQuestions() {
+    const stored = await browser.storage.local.get(SAVED_APPLICATION_QUESTIONS_KEY);
+    return stored[SAVED_APPLICATION_QUESTIONS_KEY] || [];
+}
+
+function applicationQuestionKey(entry) {
+    return (
+        (entry.company || "") + "\0" +
+        (entry.title || "") + "\0" +
+        (entry.question || "")
+    );
+}
+
+async function addSavedApplicationQuestions(pairs, job) {
+    if (!pairs.length) return;
+
+    const savedQuestions = await getSavedApplicationQuestions();
+    const byKey = new Map(
+        savedQuestions.map((entry) => [applicationQuestionKey(entry), entry])
+    );
+    const savedAt = Date.now();
+
+    for (const pair of pairs) {
+        const entry = {
+            question: pair.question,
+            answer: pair.answer,
+            fieldType: pair.fieldType || "",
+            company: job.company || "",
+            title: job.title || "",
+            url: job.url || "",
+            savedAt,
+        };
+        byKey.set(applicationQuestionKey(entry), entry);
+    }
+
+    await browser.storage.local.set({
+        [SAVED_APPLICATION_QUESTIONS_KEY]: [...byKey.values()],
+    });
+}
+
+async function clearSavedApplicationQuestions() {
+    await browser.storage.local.set({ [SAVED_APPLICATION_QUESTIONS_KEY]: [] });
+}
+
+async function removeSavedApplicationQuestion(entry) {
+    const savedQuestions = await getSavedApplicationQuestions();
+    const key = applicationQuestionKey(entry);
+    const filtered = savedQuestions.filter(
+        (saved) => applicationQuestionKey(saved) !== key
+    );
+    await browser.storage.local.set({ [SAVED_APPLICATION_QUESTIONS_KEY]: filtered });
+}
+
+function formatApplicationQuestionsDownloadLine(entry) {
+    const headerParts = [];
+    if (entry.company) headerParts.push(entry.company);
+    if (entry.title) headerParts.push(entry.title);
+    const header = headerParts.length ? headerParts.join(", ") : "Application";
+    const lines = [header];
+    if (entry.url) lines.push("URL: " + entry.url);
+    lines.push("Q: " + (entry.question || ""));
+    lines.push("A: " + (entry.answer || ""));
+    return lines.join("\n");
+}
+
+function formatApplicationQuestionsDownloadText(questions) {
+    return questions.map((entry) => formatApplicationQuestionsDownloadLine(entry)).join("\n\n");
+}
+
+function formatSavedQuestionsCountLabel(count) {
+    if (!count) return "No questions saved";
+    if (count === 1) return "1 question saved";
+    return count + " questions saved";
 }
 
 function formatSavedQuestionPreview(question) {
@@ -958,6 +1102,20 @@ function updateSavedQuestionsCountBtn(btn, menuRoot) {
             positionSavedQuestionsMenu(menuRoot, menu);
         }
     });
+}
+
+async function downloadAllSavedJobs() {
+    const jobs = await getSavedJobs();
+    const text = jobs.map((job) => formatSavedJobDownloadLine(job)).join("\n");
+    await saveTextFile(text, "saved_jobs.txt");
+
+    const questions = await getSavedApplicationQuestions();
+    if (questions.length) {
+        await saveTextFile(
+            formatApplicationQuestionsDownloadText(questions),
+            "saved_job_application_questions.txt"
+        );
+    }
 }
 
 function injectSlotStyles(slot) {
@@ -1257,10 +1415,10 @@ function buildButtons(slot) {
     slot.appendChild(downloadBtn);
 }
 
-// Persist our own active flag so the taskbar survives navigation/reload. This
-// is per-extension storage; the other sharing extension persists its slot
-// independently and the shared module re-merges them (in `order`) on each page.
-const ACTIVE_KEY = "taskbarActive";
+// Deliberately not persisted to storage: the taskbar auto-shows on LinkedIn
+// on every fresh page load, and a manual toggle only overrides that for the
+// lifetime of this page (SPA navigation within LinkedIn keeps it; a real
+// reload or a new tab re-evaluates from scratch).
 let taskbarRetryTimers = [];
 let jobhelpTaskbarActive = false;
 
@@ -1283,10 +1441,8 @@ function jobhelpHasOtherExtensionSlots() {
 function scheduleTaskbarRetries() {
     clearTaskbarRetryTimers();
     const retry = () => {
-        browser.storage.local.get(ACTIVE_KEY).then((stored) => {
-            if (!stored[ACTIVE_KEY] || !jobhelpTaskbarActive) return;
-            sharedRebuildSlotIfEmpty(EXT_KEY, buildButtons, TASKBAR_ORDER);
-        });
+        if (!jobhelpTaskbarActive) return;
+        sharedRebuildSlotIfEmpty(EXT_KEY, buildButtons, TASKBAR_ORDER);
     };
     [100, 200, 400, 800, 1500, 2500].forEach((ms) => {
         taskbarRetryTimers.push(setTimeout(retry, ms));
@@ -1333,52 +1489,28 @@ function hideTaskbar() {
 }
 
 browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  // Sidebar (extension page, no direct DOM access) asks for live page state;
-  // both are synchronous reads of the current tab's DOM.
-  if (msg.type === "GET_CURRENT_JOB") {
-    sendResponse(getJobForSave());
-    return;
-  }
-
-  if (msg.type === "SCAN_APPLICATION_QUESTIONS") {
-    const applicationRoot = getLinkedInApplicationRoot();
-    if (!applicationRoot && !findLinkedInEasyApplyMarker()) {
-      sendResponse(null);
-      return;
-    }
-    const pairs = scanLinkedInApplicationFields(applicationRoot || document);
-    sendResponse(pairs.length ? { pairs, job: getJobContextForQuestions() } : null);
-    return;
-  }
-
   if (msg.type !== "TOGGLE_TASKBAR") return;
 
-  // taskbarActive in storage is the source of truth — not host presence or buttons.
-  // An empty shell has no buttons but should still close when the user toggles off.
-  browser.storage.local.get(ACTIVE_KEY).then((stored) => {
-    if (stored[ACTIVE_KEY]) {
-      browser.storage.local.set({ [ACTIVE_KEY]: false });
-      hideTaskbar();
-      sendResponse({ visible: false });
-    } else {
-      browser.storage.local.set({ [ACTIVE_KEY]: true });
-      showTaskbar();
-      sendResponse({ visible: true });
-    }
-  });
-
-  return true;
-});
-
-// On every page load, restore our slot if it was active when we last toggled.
-browser.storage.local.get(ACTIVE_KEY).then((stored) => {
-  if (stored[ACTIVE_KEY]) {
+  // jobhelpTaskbarActive (in-memory) is the source of truth — not host
+  // presence or buttons. An empty shell has no buttons but should still
+  // close when the user toggles off.
+  if (jobhelpTaskbarActive) {
+    hideTaskbar();
+    sendResponse({ visible: false });
+  } else {
     showTaskbar();
-  } else if (
-    document.getElementById(SHARED_TASKBAR.HOST_ID) &&
-    sharedHostIsEmptyShell() &&
-    !jobhelpHasOtherExtensionSlots()
-  ) {
-    sharedRemoveTaskbarHost();
+    sendResponse({ visible: true });
   }
 });
+
+// Auto-show on LinkedIn for every fresh page load; TOGGLE_TASKBAR above can
+// override this for the rest of this page's lifetime.
+if (isLinkedInPage()) {
+  showTaskbar();
+} else if (
+  document.getElementById(SHARED_TASKBAR.HOST_ID) &&
+  sharedHostIsEmptyShell() &&
+  !jobhelpHasOtherExtensionSlots()
+) {
+  sharedRemoveTaskbarHost();
+}

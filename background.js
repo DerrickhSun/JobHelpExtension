@@ -15,14 +15,6 @@ const LEGACY_OUTPUT_PATTERNS = {
 };
 
 browser.action.onClicked.addListener((tab) => {
-  // Firefox: sidebar_action is the primary UI now. Chrome has no equivalent
-  // (side_panel is a separate, not-yet-implemented API), so it keeps toggling
-  // the in-page taskbar exactly as before.
-  if (browser.sidebarAction) {
-    browser.sidebarAction.toggle();
-    return;
-  }
-
   browser.tabs.sendMessage(tab.id, { type: "TOGGLE_TASKBAR" })
     .then((res) => console.log("taskbar visible:", res?.visible))
     .catch((err) => console.warn("no content script on this tab:", err));

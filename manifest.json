@@ -21,15 +21,11 @@
     "content_scripts": [
         {
             "matches": ["https://*/*"],
-            "js": ["content_scripts/taskbar-shared.js", "shared/storage.js", "content_scripts/content.js"],
+            "js": ["content_scripts/taskbar-shared.js", "content_scripts/content.js"],
             "css": ["content_scripts/content.css"],
             "run_at": "document_idle"
         }
     ],
-    "sidebar_action": {
-        "default_panel": "sidebar.html",
-        "default_title": "Job Help"
-    },
     "browser_specific_settings": {
         "gecko": {
             "id": "simple-extension@example.com",
