@@ -116,7 +116,56 @@ async function downloadTextFile(text, filename) {
   }
 }
 
+// Config for job-applyer's local cover_letter_server.py — see options.html.
+// The server is loopback-only by design and requires a bearer token; both are
+// set by the user via the options page rather than hardcoded here, since the
+// token is a live secret.
+const COVER_LETTER_SETTINGS_KEY = "coverLetterSettings";
+const DEFAULT_COVER_LETTER_SERVER_URL = "http://127.0.0.1:8743";
+
+async function generateCoverLetter(job) {
+  const stored = await browser.storage.local.get(COVER_LETTER_SETTINGS_KEY);
+  const settings = stored[COVER_LETTER_SETTINGS_KEY] || {};
+  const serverUrl = (settings.serverUrl || DEFAULT_COVER_LETTER_SERVER_URL).replace(/\/+$/, "");
+  const token = settings.token;
+
+  if (!token) {
+    return { error: "No API token set — configure it on the extension's options page." };
+  }
+
+  let res;
+  try {
+    res = await fetch(serverUrl + "/cover-letter", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + token,
+      },
+      body: JSON.stringify({
+        title: job.title,
+        company: job.company,
+        description: job.description || "",
+        url: job.url || "",
+      }),
+    });
+  } catch (err) {
+    return { error: "could not reach cover letter server at " + serverUrl + ": " + err.message };
+  }
+
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    return { error: (data && data.error) || ("server responded " + res.status) };
+  }
+
+  return { coverLetter: data.cover_letter, docxPath: data.docx_path };
+}
+
 browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.type === "GENERATE_COVER_LETTER") {
+    generateCoverLetter(msg.job || {}).then(sendResponse);
+    return true;
+  }
+
   if (msg.type !== "DOWNLOAD_TEXT_FILE") return;
 
   const filename = msg.filename;

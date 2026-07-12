@@ -292,6 +292,26 @@ function getJobForSave() {
     };
 }
 
+// Selector aligned with job_searcher.py's SEL["job_description"]. Unlike the
+// Python scraper we don't scroll+wait for lazy-loaded sections — by the time
+// someone clicks "Generate Cover Letter" they've already been looking at the
+// page, so it's normally already rendered.
+function getLinkedInJobDescription() {
+    const el = document.querySelector(".jobs-description__content");
+    if (!el) return "";
+    return (el.innerText || el.textContent || "").trim();
+}
+
+function getJobForCoverLetter() {
+    const job = getJobForSave();
+    if (!job) return null;
+
+    return {
+        ...job,
+        description: getLinkedInJobDescription(),
+    };
+}
+
 function formatSavedJobLabel(job) {
     const title = job.title || "";
     const company = job.company || "";
@@ -786,6 +806,22 @@ function updateSaveQuestionsButtonState(saveQuestionsBtn) {
     }
 }
 
+// Set while a generate request is in flight so the polling refresh below
+// doesn't clobber the "Generating…"/"Copied…"/error text with "Generate
+// cover letter" mid-request.
+let coverLetterBusy = false;
+
+function updateCoverLetterButtonState(coverLetterBtn) {
+    if (!coverLetterBtn || coverLetterBusy) return;
+    if (getJobForSave()) {
+        coverLetterBtn.disabled = false;
+        coverLetterBtn.textContent = "Generate cover letter";
+    } else {
+        coverLetterBtn.disabled = true;
+        coverLetterBtn.textContent = "No job found";
+    }
+}
+
 function stopSaveButtonRefresh() {
     if (saveButtonRefreshTimer) {
         clearInterval(saveButtonRefreshTimer);
@@ -793,11 +829,12 @@ function stopSaveButtonRefresh() {
     }
 }
 
-function startSaveButtonsRefresh(saveBtn, saveQuestionsBtn) {
+function startSaveButtonsRefresh(saveBtn, saveQuestionsBtn, coverLetterBtn) {
     stopSaveButtonRefresh();
     const refresh = () => {
         updateSaveButtonState(saveBtn);
         updateSaveQuestionsButtonState(saveQuestionsBtn);
+        updateCoverLetterButtonState(coverLetterBtn);
     };
     refresh();
     saveButtonRefreshTimer = setInterval(refresh, SAVE_BUTTON_REFRESH_MS);
@@ -1302,7 +1339,41 @@ function buildButtons(slot) {
         updateSavedQuestionsCountBtn(questionsBtn, questionsWrap);
     });
 
-    startSaveButtonsRefresh(saveBtn, saveQuestionsBtn);
+    const coverLetterBtn = document.createElement("button");
+    coverLetterBtn.type = "button";
+    coverLetterBtn.addEventListener("click", async () => {
+        const job = getJobForCoverLetter();
+        if (!job) return;
+
+        coverLetterBusy = true;
+        coverLetterBtn.disabled = true;
+        coverLetterBtn.textContent = "Generating…";
+
+        let res;
+        try {
+            res = await browser.runtime.sendMessage({ type: "GENERATE_COVER_LETTER", job });
+        } catch (err) {
+            res = { error: err.message };
+        }
+
+        if (!res || res.error) {
+            coverLetterBtn.textContent = "Failed: " + ((res && res.error) || "unknown error");
+        } else {
+            try {
+                await navigator.clipboard.writeText(res.coverLetter || "");
+                coverLetterBtn.textContent = "Copied to clipboard!";
+            } catch (err) {
+                coverLetterBtn.textContent = "Generated (copy failed)";
+            }
+        }
+
+        setTimeout(() => {
+            coverLetterBusy = false;
+            updateCoverLetterButtonState(coverLetterBtn);
+        }, 3000);
+    });
+
+    startSaveButtonsRefresh(saveBtn, saveQuestionsBtn, coverLetterBtn);
 
     const questionsWrap = document.createElement("div");
     questionsWrap.className = "jobhelp-questions-wrap";
@@ -1410,6 +1481,7 @@ function buildButtons(slot) {
     menuWrap.appendChild(menu);
     slot.appendChild(saveQuestionsBtn);
     slot.appendChild(saveBtn);
+    slot.appendChild(coverLetterBtn);
     slot.appendChild(questionsWrap);
     slot.appendChild(menuWrap);
     slot.appendChild(downloadBtn);
