@@ -14,12 +14,6 @@ const LEGACY_OUTPUT_PATTERNS = {
     /^job_application_questions( \(\d+\))?\.txt$/i,
 };
 
-browser.action.onClicked.addListener((tab) => {
-  browser.tabs.sendMessage(tab.id, { type: "TOGGLE_TASKBAR" })
-    .then((res) => console.log("taskbar visible:", res?.visible))
-    .catch((err) => console.warn("no content script on this tab:", err));
-});
-
 async function removeDownloadFile(item) {
   if (!item || item.state !== "complete") return;
 
@@ -116,19 +110,25 @@ async function downloadTextFile(text, filename) {
   }
 }
 
-// Config for job-applyer's local cover_letter_server.py — see options.html.
+// Config for job-applyer's local extension_server.py — see options.html.
 // The server is loopback-only by design and requires a bearer token; both are
 // set by the user via the options page rather than hardcoded here, since the
-// token is a live secret.
+// token is a live secret. Same server/settings for both cover-letter
+// generation and form-field answers below.
 const COVER_LETTER_SETTINGS_KEY = "coverLetterSettings";
 const DEFAULT_COVER_LETTER_SERVER_URL = "http://127.0.0.1:8743";
 
-async function generateCoverLetter(job) {
+async function getExtensionServerSettings() {
   const stored = await browser.storage.local.get(COVER_LETTER_SETTINGS_KEY);
   const settings = stored[COVER_LETTER_SETTINGS_KEY] || {};
-  const serverUrl = (settings.serverUrl || DEFAULT_COVER_LETTER_SERVER_URL).replace(/\/+$/, "");
-  const token = settings.token;
+  return {
+    serverUrl: (settings.serverUrl || DEFAULT_COVER_LETTER_SERVER_URL).replace(/\/+$/, ""),
+    token: settings.token,
+  };
+}
 
+async function generateCoverLetter(job) {
+  const { serverUrl, token } = await getExtensionServerSettings();
   if (!token) {
     return { error: "No API token set — configure it on the extension's options page." };
   }
@@ -149,7 +149,7 @@ async function generateCoverLetter(job) {
       }),
     });
   } catch (err) {
-    return { error: "could not reach cover letter server at " + serverUrl + ": " + err.message };
+    return { error: "could not reach extension server at " + serverUrl + ": " + err.message };
   }
 
   const data = await res.json().catch(() => null);
@@ -160,9 +160,42 @@ async function generateCoverLetter(job) {
   return { coverLetter: data.cover_letter, docxPath: data.docx_path };
 }
 
+async function answerFields(fields) {
+  const { serverUrl, token } = await getExtensionServerSettings();
+  if (!token) {
+    return { error: "No API token set — configure it on the extension's options page." };
+  }
+
+  let res;
+  try {
+    res = await fetch(serverUrl + "/answer-fields", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + token,
+      },
+      body: JSON.stringify({ fields }),
+    });
+  } catch (err) {
+    return { error: "could not reach extension server at " + serverUrl + ": " + err.message };
+  }
+
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    return { error: (data && data.error) || ("server responded " + res.status) };
+  }
+
+  return { answers: data.answers || [] };
+}
+
 browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "GENERATE_COVER_LETTER") {
     generateCoverLetter(msg.job || {}).then(sendResponse);
+    return true;
+  }
+
+  if (msg.type === "ANSWER_FIELDS") {
+    answerFields(msg.fields || []).then(sendResponse);
     return true;
   }
 

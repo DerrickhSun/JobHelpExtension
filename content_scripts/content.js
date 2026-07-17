@@ -1551,38 +1551,283 @@ function showTaskbar() {
     scheduleTaskbarRetries();
 }
 
-function hideTaskbar() {
-    jobhelpTaskbarActive = false;
-    stopSaveButtonRefresh();
-    clearTaskbarRetryTimers();
-    sharedStopSlotIntegrityObserver();
-    // Cooperative close: remove only our slot; host stays for other extensions.
-    unregisterTaskbar(EXT_KEY);
-}
-
-browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type !== "TOGGLE_TASKBAR") return;
-
-  // jobhelpTaskbarActive (in-memory) is the source of truth — not host
-  // presence or buttons. An empty shell has no buttons but should still
-  // close when the user toggles off.
-  if (jobhelpTaskbarActive) {
-    hideTaskbar();
-    sendResponse({ visible: false });
-  } else {
+// Auto-show on LinkedIn for every fresh page load. The taskbar has no manual
+// toggle anymore — the toolbar icon now opens the form-fill popup instead
+// (browser.action.onClicked no longer fires once default_popup is set).
+// Gated to the top frame only: content.js now runs in every matching iframe
+// too (all_frames, for scanning fields inside embedded ATS forms), and a
+// full-width fixed taskbar bar has no sensible rendering inside a nested
+// iframe's own viewport.
+if (window.top === window) {
+  if (isLinkedInPage()) {
     showTaskbar();
-    sendResponse({ visible: true });
+  } else if (
+    document.getElementById(SHARED_TASKBAR.HOST_ID) &&
+    sharedHostIsEmptyShell() &&
+    !jobhelpHasOtherExtensionSlots()
+  ) {
+    sharedRemoveTaskbarHost();
   }
-});
-
-// Auto-show on LinkedIn for every fresh page load; TOGGLE_TASKBAR above can
-// override this for the rest of this page's lifetime.
-if (isLinkedInPage()) {
-  showTaskbar();
-} else if (
-  document.getElementById(SHARED_TASKBAR.HOST_ID) &&
-  sharedHostIsEmptyShell() &&
-  !jobhelpHasOtherExtensionSlots()
-) {
-  sharedRemoveTaskbarHost();
 }
+
+// ---- generic form fill + save fields (any site, triggered from the popup) -
+// scanLinkedInApplicationFields reads already-answered LinkedIn Easy Apply
+// fields using LinkedIn-specific markup; scanFormFields below does the same
+// two jobs (fill blank fields, save whatever's currently on the page) for
+// any site, using generic/DOM-standard label detection instead
+// (label[for], wrapping <label>, aria-*, placeholder, fieldset/legend).
+
+const GENERIC_TEXT_INPUT_TYPES = new Set(["", "text", "email", "tel", "number", "url", "search"]);
+
+function isGenericTextInput(el) {
+    if (el.tagName !== "INPUT") return false;
+    return GENERIC_TEXT_INPUT_TYPES.has((el.getAttribute("type") || "").toLowerCase());
+}
+
+function getGenericFieldLabel(el) {
+    if (el.id) {
+        const label = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+        const text = label && getLinkedInElementText(label);
+        if (text) return text;
+    }
+
+    const wrappingLabel = el.closest("label");
+    const wrappingText = wrappingLabel && getLinkedInElementText(wrappingLabel);
+    if (wrappingText) return wrappingText;
+
+    const ariaLabel = (el.getAttribute("aria-label") || "").trim();
+    if (ariaLabel) return ariaLabel;
+
+    const labelledBy = el.getAttribute("aria-labelledby");
+    if (labelledBy) {
+        const text = labelledBy
+            .split(/\s+/)
+            .map((id) => document.getElementById(id))
+            .filter(Boolean)
+            .map((node) => getLinkedInElementText(node))
+            .join(" ")
+            .trim();
+        if (text) return text;
+    }
+
+    return (el.getAttribute("placeholder") || "").trim();
+}
+
+function getFieldsetLegendLabel(fieldset) {
+    const legend = fieldset.querySelector(":scope > legend");
+    return legend ? getLinkedInElementText(legend) : "";
+}
+
+function getRadioOrCheckboxLabel(input) {
+    if (input.id) {
+        const label = document.querySelector('label[for="' + CSS.escape(input.id) + '"]');
+        const text = label && getLinkedInElementText(label);
+        if (text) return text;
+    }
+    const wrappingLabel = input.closest("label");
+    if (wrappingLabel) return getLinkedInElementText(wrappingLabel);
+    return (input.getAttribute("aria-label") || input.value || "").trim();
+}
+
+// Joins every checked control's value/label (checkbox groups can have more
+// than one checked); radio groups only ever have at most one.
+function getCheckedGroupValue(controls) {
+    return controls
+        .filter((c) => c.checked)
+        .map((c) => c.value || getRadioOrCheckboxLabel(c) || "")
+        .filter(Boolean)
+        .join(", ");
+}
+
+// Only fieldset/legend-grouped radio and checkbox groups are handled —
+// ungrouped/ambiguous radios are skipped rather than guessed at (a fieldset
+// with a legend is the one broadly-supported, unambiguous way to associate a
+// question with a set of options).
+//
+// `onlyBlank: true` (form-fill) only returns fields with no current value;
+// `onlyBlank: false` (save-fields) returns every field found, filled or not,
+// each descriptor's `value` carrying its current state — mirrors what
+// scanLinkedInApplicationFields does for LinkedIn's Easy Apply forms, just
+// with generic/DOM-standard label detection instead of LinkedIn markup.
+function scanFormFields(root, { onlyBlank } = {}) {
+    root = root || document;
+    const descriptors = [];
+    const elements = [];
+    const handledFieldsets = new Set();
+
+    function addField(label, type, element, value) {
+        const trimmed = (label || "").trim();
+        if (!trimmed) return;
+        descriptors.push({ label: trimmed, type, value: value || "" });
+        elements.push(element);
+    }
+
+    root.querySelectorAll("input, textarea, select").forEach((el) => {
+        if (!isLinkedInFormControlVisible(el)) return;
+        const type = (el.getAttribute("type") || "").toLowerCase();
+        if (type === "radio" || type === "checkbox") return; // handled via the fieldset pass below
+
+        let fieldType = null;
+        if (isGenericTextInput(el)) fieldType = "text";
+        else if (el.tagName === "TEXTAREA") fieldType = "textarea";
+        else if (el.tagName === "SELECT") fieldType = "select";
+        if (!fieldType) return;
+
+        if (onlyBlank && el.value) return;
+        addField(getGenericFieldLabel(el), fieldType, el, el.value);
+    });
+
+    root.querySelectorAll("fieldset").forEach((fieldset) => {
+        if (handledFieldsets.has(fieldset) || !isVisibleElement(fieldset)) return;
+
+        const label = getFieldsetLegendLabel(fieldset);
+        if (!label) return;
+
+        const radios = [...fieldset.querySelectorAll('input[type="radio"]')].filter(isLinkedInFormControlVisible);
+        if (radios.length) {
+            handledFieldsets.add(fieldset);
+            const value = getCheckedGroupValue(radios);
+            if (!onlyBlank || !value) {
+                addField(label, "radio", { fieldset, controls: radios }, value);
+            }
+            return;
+        }
+
+        const checkboxes = [...fieldset.querySelectorAll('input[type="checkbox"]')].filter(isLinkedInFormControlVisible);
+        if (checkboxes.length) {
+            handledFieldsets.add(fieldset);
+            const value = getCheckedGroupValue(checkboxes);
+            if (!onlyBlank || !value) {
+                addField(label, "checkbox_group", { fieldset, controls: checkboxes }, value);
+            }
+        }
+    });
+
+    return { descriptors, elements };
+}
+
+function normalizeMatchText(text) {
+    return (text || "").trim().toLowerCase();
+}
+
+function fillTextLikeField(el, value) {
+    el.value = value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function fillSelectField(el, value) {
+    const target = normalizeMatchText(value);
+    const option = [...el.options].find(
+        (o) => normalizeMatchText(o.value) === target || normalizeMatchText(o.textContent) === target
+    );
+    if (!option) return false;
+    el.value = option.value;
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+}
+
+function fillGroupField(group, value) {
+    const target = normalizeMatchText(value);
+    const match = group.controls.find(
+        (input) => normalizeMatchText(input.value) === target ||
+            normalizeMatchText(getRadioOrCheckboxLabel(input)) === target
+    );
+    if (!match) return false;
+    match.checked = true;
+    match.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+}
+
+function applyFieldAnswer(descriptor, element, answer) {
+    if (!answer || answer.value == null) return false;
+    const value = String(answer.value);
+
+    if (descriptor.type === "text" || descriptor.type === "textarea") {
+        fillTextLikeField(element, value);
+        return true;
+    }
+    if (descriptor.type === "select") return fillSelectField(element, value);
+    if (descriptor.type === "radio" || descriptor.type === "checkbox_group") {
+        return fillGroupField(element, value);
+    }
+    return false;
+}
+
+// On a non-LinkedIn page getJobContextForQuestions() comes back entirely
+// empty (it's gated on LinkedIn-specific signals) — fall back to the page's
+// own title/URL so saved entries still carry some context.
+function getGenericJobContext() {
+    const linkedInContext = getJobContextForQuestions();
+    if (linkedInContext.title || linkedInContext.company || linkedInContext.url) {
+        return linkedInContext;
+    }
+    return { title: document.title || "", company: "", url: location.href };
+}
+
+// Sent by popup.js (browser.tabs.sendMessage) — these are the only messages
+// content.js handles now that the taskbar has no manual toggle.
+browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type === "FILL_FORM") {
+        (async () => {
+            const { descriptors, elements } = scanFormFields(document, { onlyBlank: true });
+            if (!descriptors.length) {
+                sendResponse({ filled: 0, total: 0, flagged: 0 });
+                return;
+            }
+
+            const fields = descriptors.map((d) => ({ label: d.label, type: d.type }));
+            let res;
+            try {
+                res = await browser.runtime.sendMessage({ type: "ANSWER_FIELDS", fields });
+            } catch (err) {
+                sendResponse({ error: err.message });
+                return;
+            }
+
+            if (!res || res.error) {
+                sendResponse({ error: (res && res.error) || "unknown error" });
+                return;
+            }
+
+            const answers = res.answers || [];
+            let filled = 0;
+            let flagged = 0;
+            descriptors.forEach((descriptor, i) => {
+                const answer = answers[i];
+                if (answer && answer.flag === "discard") {
+                    flagged += 1;
+                    return;
+                }
+                if (applyFieldAnswer(descriptor, elements[i], answer)) {
+                    filled += 1;
+                }
+            });
+
+            sendResponse({ filled, total: descriptors.length, flagged });
+        })();
+
+        return true;
+    }
+
+    if (msg.type === "SAVE_FIELDS") {
+        (async () => {
+            const { descriptors } = scanFormFields(document, { onlyBlank: false });
+            if (!descriptors.length) {
+                sendResponse({ saved: 0 });
+                return;
+            }
+
+            const pairs = descriptors.map((d) => ({
+                question: d.label,
+                answer: d.value,
+                fieldType: d.type,
+            }));
+
+            await addSavedApplicationQuestions(pairs, getGenericJobContext());
+            sendResponse({ saved: pairs.length });
+        })();
+
+        return true;
+    }
+});

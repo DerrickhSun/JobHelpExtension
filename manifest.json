@@ -9,7 +9,9 @@
     "permissions": [
         "activeTab",
         "storage",
-        "downloads"
+        "downloads",
+        "clipboardWrite",
+        "webNavigation"
     ],
     "host_permissions": [
         "https://*/*",
@@ -23,6 +25,7 @@
     "content_scripts": [
         {
             "matches": ["https://*/*"],
+            "all_frames": true,
             "js": ["content_scripts/taskbar-shared.js", "content_scripts/content.js"],
             "css": ["content_scripts/content.css"],
             "run_at": "document_idle"
@@ -41,7 +44,8 @@
         }
     },
     "action": {
-        "default_title": "Taskbar",
+        "default_title": "Job Help",
+        "default_popup": "popup.html",
         "default_icon": "icons/write-512.png",
         "theme_icons": [
         {
