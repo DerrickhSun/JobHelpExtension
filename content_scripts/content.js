@@ -1639,6 +1639,45 @@ function getCheckedGroupValue(controls) {
         .join(", ");
 }
 
+// Ashby-style (and similar) Yes/No question: a single <input type="checkbox">
+// that's part of the submitted form data but deliberately display:none (the
+// real UI is two sibling <button>Yes</button>/<button>No</button> elements
+// that toggle it) — no <fieldset> at all, so this needs its own detection
+// separate from the fieldset-grouped radio/checkbox pass above. Answering it
+// means clicking the right button (see fillYesNoToggle), not touching the
+// hidden checkbox directly — that's what actually drives the page's own
+// click handlers/state, the same way a real user would answer it.
+function getYesNoToggleButtons(checkbox) {
+    const container = checkbox.parentElement;
+    if (!container) return null;
+    const buttons = [...container.querySelectorAll(":scope > button")];
+    if (buttons.length !== 2) return null;
+
+    const yesBtn = buttons.find((b) => normalizeMatchText(b.textContent) === "yes");
+    const noBtn = buttons.find((b) => normalizeMatchText(b.textContent) === "no");
+    if (!yesBtn || !noBtn) return null;
+    return { yesBtn, noBtn };
+}
+
+// CSS-module class names are build-hashed (e.g. "_active_1svni_57"), so match
+// an "active"-ish token bounded by start/`-`/`_` rather than an exact class —
+// specific enough to avoid false positives like "inactive".
+function isToggleButtonActive(btn) {
+    return /(^|[-_])(active|selected|checked|pressed)([-_]|$)/i.test(btn.className);
+}
+
+// The <label for=...> here references the checkbox's `name`, not an `id`
+// (Ashby's checkbox has no `id` at all) — try that before falling back to the
+// normal generic lookup.
+function getYesNoToggleLabel(checkbox) {
+    if (checkbox.name) {
+        const label = document.querySelector('label[for="' + CSS.escape(checkbox.name) + '"]');
+        const text = label && getLinkedInElementText(label);
+        if (text) return text;
+    }
+    return getGenericFieldLabel(checkbox);
+}
+
 // Only fieldset/legend-grouped radio and checkbox groups are handled —
 // ungrouped/ambiguous radios are skipped rather than guessed at (a fieldset
 // with a legend is the one broadly-supported, unambiguous way to associate a
@@ -1663,9 +1702,25 @@ function scanFormFields(root, { onlyBlank } = {}) {
     }
 
     root.querySelectorAll("input, textarea, select").forEach((el) => {
-        if (!isLinkedInFormControlVisible(el)) return;
         const type = (el.getAttribute("type") || "").toLowerCase();
-        if (type === "radio" || type === "checkbox") return; // handled via the fieldset pass below
+
+        if (type === "checkbox") {
+            // Checked separately from isLinkedInFormControlVisible below: this
+            // pattern's checkbox is deliberately display:none, so visibility
+            // is judged by its visible Yes/No buttons instead.
+            const toggle = getYesNoToggleButtons(el);
+            if (toggle && isVisibleElement(toggle.yesBtn) && isVisibleElement(toggle.noBtn)) {
+                const answer = isToggleButtonActive(toggle.yesBtn) ? "Yes"
+                    : isToggleButtonActive(toggle.noBtn) ? "No" : "";
+                if (!onlyBlank || !answer) {
+                    addField(getYesNoToggleLabel(el), "radio", { yesNoToggle: true, ...toggle }, answer);
+                }
+            }
+            return; // otherwise handled via the fieldset checkbox_group pass below
+        }
+
+        if (!isLinkedInFormControlVisible(el)) return;
+        if (type === "radio") return; // handled via the fieldset pass below
 
         let fieldType = null;
         if (isGenericTextInput(el)) fieldType = "text";
@@ -1739,6 +1794,23 @@ function fillGroupField(group, value) {
     return true;
 }
 
+// Click the real Yes/No button rather than touching the hidden checkbox
+// directly — the page's own click handler is what actually updates its
+// (likely React) state; setting .checked on a display:none input the page
+// isn't watching wouldn't do anything.
+function fillYesNoToggle(toggle, value) {
+    const target = normalizeMatchText(value);
+    if (target === "yes") {
+        toggle.yesBtn.click();
+        return true;
+    }
+    if (target === "no") {
+        toggle.noBtn.click();
+        return true;
+    }
+    return false;
+}
+
 function applyFieldAnswer(descriptor, element, answer) {
     if (!answer || answer.value == null) return false;
     const value = String(answer.value);
@@ -1749,6 +1821,7 @@ function applyFieldAnswer(descriptor, element, answer) {
     }
     if (descriptor.type === "select") return fillSelectField(element, value);
     if (descriptor.type === "radio" || descriptor.type === "checkbox_group") {
+        if (element.yesNoToggle) return fillYesNoToggle(element, value);
         return fillGroupField(element, value);
     }
     return false;

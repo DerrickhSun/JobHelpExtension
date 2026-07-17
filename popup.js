@@ -19,17 +19,20 @@ async function sendToAllFrames(message) {
     try {
         frames = await browser.webNavigation.getAllFrames({ tabId: tab.id });
     } catch (err) {
+        console.log("[JobHelp] getAllFrames threw:", err.message);
         frames = null;
     }
     if (!frames || !frames.length) frames = [{ frameId: 0 }];
+    console.log("[JobHelp] frames found:", frames.map((f) => f.frameId + ": " + f.url));
 
     const results = [];
     for (const frame of frames) {
         try {
             const res = await browser.tabs.sendMessage(tab.id, message, { frameId: frame.frameId });
+            console.log("[JobHelp] frame", frame.frameId, "responded:", JSON.stringify(res));
             if (res) results.push(res);
         } catch (err) {
-            // No content script in this frame — skip it.
+            console.log("[JobHelp] frame", frame.frameId, "(" + frame.url + ") sendMessage failed:", err.message);
         }
     }
     return results;
@@ -37,17 +40,23 @@ async function sendToAllFrames(message) {
 
 // Sums `sumKeys` across every frame's successful response. If every frame
 // errored (or none responded), surfaces the first error instead of a
-// fabricated all-zero result.
+// fabricated all-zero result. A frame that errors (e.g. it found fields but
+// couldn't reach the server) is never silently dropped just because some
+// *other*, unrelated frame trivially "succeeded" with nothing to report —
+// its error is carried along in `frameErrors` so the caller can still show it.
 function aggregateResults(results, sumKeys) {
     const oks = results.filter((r) => r && !r.error);
+    const errors = results.filter((r) => r && r.error);
+
     if (!oks.length) {
-        const firstError = results.find((r) => r && r.error);
-        return { error: (firstError && firstError.error) || "Couldn't reach this page (try reloading it first)." };
+        return { error: (errors[0] && errors[0].error) || "Couldn't reach this page (try reloading it first)." };
     }
+
     const out = {};
     for (const key of sumKeys) {
         out[key] = oks.reduce((sum, r) => sum + (r[key] || 0), 0);
     }
+    if (errors.length) out.frameErrors = errors.map((e) => e.error);
     return out;
 }
 
@@ -64,7 +73,9 @@ fillFormBtn.addEventListener("click", async () => {
         }
 
         if (!res.total) {
-            statusEl.textContent = "No fillable fields found on this page.";
+            statusEl.textContent = res.frameErrors
+                ? "Found fields but couldn't process them: " + res.frameErrors[0]
+                : "No fillable fields found on this page.";
             return;
         }
 
@@ -72,6 +83,9 @@ fillFormBtn.addEventListener("click", async () => {
             " field" + (res.total === 1 ? "" : "s") + ".";
         if (res.flagged) {
             summary += "\n" + res.flagged + " flagged for manual review.";
+        }
+        if (res.frameErrors) {
+            summary += "\n" + res.frameErrors.length + " frame(s) errored: " + res.frameErrors[0];
         }
         statusEl.textContent = summary;
     } finally {
@@ -91,9 +105,18 @@ saveFieldsBtn.addEventListener("click", async () => {
             return;
         }
 
-        statusEl.textContent = res.saved
-            ? "Saved " + res.saved + " field" + (res.saved === 1 ? "" : "s") + "."
-            : "No fields found on this page.";
+        if (!res.saved) {
+            statusEl.textContent = res.frameErrors
+                ? "Found fields but couldn't save them: " + res.frameErrors[0]
+                : "No fields found on this page.";
+            return;
+        }
+
+        let summary = "Saved " + res.saved + " field" + (res.saved === 1 ? "" : "s") + ".";
+        if (res.frameErrors) {
+            summary += "\n" + res.frameErrors.length + " frame(s) errored: " + res.frameErrors[0];
+        }
+        statusEl.textContent = summary;
     } finally {
         saveFieldsBtn.disabled = false;
     }
