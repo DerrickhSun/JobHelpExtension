@@ -1615,7 +1615,14 @@ function getGenericFieldLabel(el) {
 
 function getFieldsetLegendLabel(fieldset) {
     const legend = fieldset.querySelector(":scope > legend");
-    return legend ? getLinkedInElementText(legend) : "";
+    if (legend) return getLinkedInElementText(legend);
+    // Some component libraries use a leading <label> as the group heading
+    // instead of a semantic <legend> (e.g. Ashby's EEO gender/race/veteran
+    // question fieldsets) — its `for` often doesn't resolve to anything
+    // (matches a `data-field-path` wrapper, not an actual control), so this
+    // is purely positional: first <label> that's a direct child.
+    const leadingLabel = fieldset.querySelector(":scope > label");
+    return leadingLabel ? getLinkedInElementText(leadingLabel) : "";
 }
 
 function getRadioOrCheckboxLabel(input) {
