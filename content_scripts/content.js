@@ -1818,18 +1818,34 @@ function fillYesNoToggle(toggle, value) {
     return false;
 }
 
+// The server may offer several acceptable answers in priority order (e.g. ["No", "Not
+// applicable"]) when a rule has more than one — try each until one matches an option this
+// field actually has, and leave the field untouched if none do. `answer.values` is the new
+// candidate-list shape; `answer.value` alone (older server / no candidates) is treated as a
+// one-item list so this still works unchanged against a server that hasn't been updated.
 function applyFieldAnswer(descriptor, element, answer) {
-    if (!answer || answer.value == null) return false;
-    const value = String(answer.value);
+    if (!answer) return false;
+    const candidates = Array.isArray(answer.values) && answer.values.length
+        ? answer.values
+        : (answer.value != null ? [answer.value] : []);
+    if (!candidates.length) return false;
 
     if (descriptor.type === "text" || descriptor.type === "textarea") {
-        fillTextLikeField(element, value);
+        // Free text always "succeeds" — there's no notion of the field rejecting a value, so
+        // only the top-priority candidate is meaningful here.
+        fillTextLikeField(element, String(candidates[0]));
         return true;
     }
-    if (descriptor.type === "select") return fillSelectField(element, value);
-    if (descriptor.type === "radio" || descriptor.type === "checkbox_group") {
-        if (element.yesNoToggle) return fillYesNoToggle(element, value);
-        return fillGroupField(element, value);
+
+    for (const raw of candidates) {
+        const value = String(raw);
+        let ok = false;
+        if (descriptor.type === "select") {
+            ok = fillSelectField(element, value);
+        } else if (descriptor.type === "radio" || descriptor.type === "checkbox_group") {
+            ok = element.yesNoToggle ? fillYesNoToggle(element, value) : fillGroupField(element, value);
+        }
+        if (ok) return true;
     }
     return false;
 }
